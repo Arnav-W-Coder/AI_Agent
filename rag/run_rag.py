@@ -1,0 +1,1 @@
+# running RAG with LangChain, ChromaDB, and Ollama LLM
