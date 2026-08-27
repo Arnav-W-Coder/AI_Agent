@@ -26,9 +26,12 @@ Faithfulness score:
 """
 import logging
 import re
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from langchain_ollama import ChatOllama
+
+if TYPE_CHECKING:
+    from config import RAGConfig
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -56,27 +59,26 @@ UNCERTAINTY_PHRASES = [
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
 _CRITIC_PROMPT = ChatPromptTemplate.from_template("""
-You are a strict fact-checker. Compare the answer against the retrieved context.
+Check the ANSWER for facts that are not in the CONTEXT.
 
-RETRIEVED CONTEXT:
+CONTEXT:
 {context}
 
-AGENT ANSWER:
+ANSWER:
 {answer}
 
-Task:
-Find every specific claim in the answer that CANNOT be traced word-for-word
-or by clear paraphrase to the retrieved context above.
+Only look at facts that appear in the ANSWER.
+A fact is supported if it appears in the CONTEXT — synonyms and paraphrases count.
+Omission is not hallucination: facts in the CONTEXT but absent from the ANSWER are fine.
 
-Rules:
-- List unsupported claims as concise bullet points. Quote the exact phrase.
-- Flag specific facts: names, numbers, dates, organisations, causal claims.
-- Do NOT flag general summaries that broadly reflect the context.
-- If ALL claims are supported, reply with exactly one word: FULLY_GROUNDED
-- If there are unsupported claims, start your reply with the line:
-  UNSUPPORTED_CLAIMS:
-  then list each claim as a bullet starting with "•".
-- Reply with nothing else — no preamble, no sign-off.
+If every fact in the ANSWER is supported, output this single word:
+FULLY_GROUNDED
+
+If any fact in the ANSWER is not in the CONTEXT, output:
+UNSUPPORTED_CLAIMS:
+• <the unsupported phrase from the answer>
+
+Output only the result. No explanation. No reasoning. No other text.
 """)
 
 _REPAIR_PROMPT = ChatPromptTemplate.from_template("""
@@ -135,10 +137,11 @@ class CriticAndRepair:
         polished = critic.polish(repaired)
     """
 
-    def __init__(self, llm: ChatOllama) -> None:
+    def __init__(self, llm: ChatOllama, cfg: Optional["RAGConfig"] = None) -> None:
         self._critic_chain = _CRITIC_PROMPT  | llm | StrOutputParser()
         self._repair_chain = _REPAIR_PROMPT  | llm | StrOutputParser()
         self._polish_chain = _POLISH_PROMPT  | llm | StrOutputParser()
+        self._cfg = cfg   # None → fallback to defaults defined in RAGConfig
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -213,13 +216,17 @@ class CriticAndRepair:
         Stored in query_metrics.answer_faithfulness.
 
           GROUNDED with no claims      → 1.0
-          HALLUCINATED with N claims   → max(0, 1 - 0.2 * N)
+          HALLUCINATED with N claims   → max(0, 1 - cfg.critic_claim_penalty * N)
           No context                   → 0.0
         """
         if verdict == "GROUNDED":
             return 1.0
+        penalty  = (
+            self._cfg.critic_claim_penalty
+            if self._cfg is not None else 0.20  # default matches RAGConfig default
+        )
         n_claims = claims.count("•")
-        return max(0.0, round(1.0 - 0.2 * n_claims, 2))
+        return max(0.0, round(1.0 - penalty * n_claims, 2))
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -237,11 +244,16 @@ class CriticAndRepair:
             1 for s in sentences
             if any(phrase in s.lower() for phrase in UNCERTAINTY_PHRASES)
         )
-        ratio = uncertainty_count / len(sentences)
-        log.debug(
-            f"[Critic] Uncertainty ratio: {uncertainty_count}/{len(sentences)} = {ratio:.2f}"
+        ratio     = uncertainty_count / len(sentences)
+        threshold = (
+            self._cfg.critic_uncertainty_threshold
+            if self._cfg is not None else 0.50
         )
-        return ratio >= 0.5
+        log.debug(
+            f"[Critic] Uncertainty ratio: {uncertainty_count}/{len(sentences)} = "
+            f"{ratio:.2f} (threshold={threshold})"
+        )
+        return ratio >= threshold
 
     def _parse_critic_output(self, raw: str) -> tuple[str, str, float]:
         """
@@ -259,9 +271,14 @@ class CriticAndRepair:
             claims_section = re.sub(
                 r"UNSUPPORTED[_ ]CLAIMS\s*:?\s*", "", raw, flags=re.IGNORECASE
             ).strip()
-            n = claims_section.count("•")
-            score = max(0.0, round(1.0 - 0.2 * n, 2))
-            log.info(f"[Critic] HALLUCINATED — {n} unsupported claim(s)")
+            n     = claims_section.count("•")
+            # Use config penalty if available, otherwise fall back to class default
+            penalty = (
+                self._cfg.critic_claim_penalty
+                if self._cfg is not None else 0.20  # default matches RAGConfig default
+            )
+            score = max(0.0, round(1.0 - penalty * n, 2))
+            log.info(f"[Critic] HALLUCINATED — {n} unsupported claim(s) | penalty={penalty}")
             if claims_section:
                 log.info(f"[Critic] Claims:\n{claims_section}")
             return "HALLUCINATED", claims_section, score

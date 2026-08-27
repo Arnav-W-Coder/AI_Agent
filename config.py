@@ -50,6 +50,27 @@ class RAGConfig:
     latency_warn_ms:     int   = 6000  # log warning if total latency > this
 
     # ── Web scraping ──────────────────────────────────────────────────────────
-    max_scrape_urls:  int = 5
-    ddg_retries:      int = 3
-    min_domain_score: int = 30
+    max_scrape_urls:   int  = 5
+    ddg_retries:       int  = 3
+    min_domain_score:  int  = 30
+    web_top_k:         int  = 4     # web chunks kept after temp-store similarity search
+    always_scrape_web: bool = True  # True → parallel PDF+web always; False → fallback only
+
+    # ── Critic thresholds ─────────────────────────────────────────────────────
+    # All formerly hardcoded — change here without touching critic.py or pipeline.py
+    critic_uncertainty_threshold: float = 0.50
+    # Ratio of hedge sentences in an answer before it is auto-accepted as
+    # "I don't know". Lower = stricter (more answers sent to LLM critic).
+    # 0.50 means half the sentences must be hedges; 0.33 means one in three.
+
+    critic_claim_penalty: float = 0.20
+    # Faithfulness score deducted per unsupported claim found by the critic.
+    # score = max(0, 1.0 - penalty × num_claims). Lower = more lenient.
+    # 0.20 → 1 claim = 0.80, 2 claims = 0.60, 5+ claims = 0.0.
+
+    # ── Rewriter auto-labeling ────────────────────────────────────────────────
+    rewriter_helpful_min_score:    float = 0.80
+    # Faithfulness score >= this → rewrite is auto-labeled helpful (enters few-shot pool).
+    rewriter_unhelpful_max_score:  float = 0.40
+    # Faithfulness score <  this → rewrite is auto-labeled unhelpful (excluded from pool).
+    # Scores between the two thresholds receive no auto-label (neutral; awaits user rating).
