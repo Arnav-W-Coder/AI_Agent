@@ -98,6 +98,20 @@ CREATE TABLE IF NOT EXISTS query_metrics (
     created_at            REAL    NOT NULL
 );
 
+-- ── Web scrape cache ────────────────────────────────────────────────────────────
+-- Tracks every URL the pipeline has scraped. Chunks live in ChromaDB (chroma_web/).
+-- SQLite stores the metadata so eviction can target specific Chroma IDs.
+CREATE TABLE IF NOT EXISTS web_scrape_cache (
+    url          TEXT PRIMARY KEY,
+    title        TEXT,
+    scraped_at   REAL NOT NULL,
+    expires_at   REAL NOT NULL,
+    chunk_count  INTEGER DEFAULT 0,
+    chunk_ids    TEXT DEFAULT '[]'  -- JSON array of ChromaDB IDs
+);
+CREATE INDEX IF NOT EXISTS idx_web_cache_expires ON web_scrape_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_web_cache_scraped ON web_scrape_cache(scraped_at);
+
 -- ── Drift log ─────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS drift_log (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,

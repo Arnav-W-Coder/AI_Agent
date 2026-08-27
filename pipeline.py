@@ -45,6 +45,7 @@ from ingestion import AsyncIngestionPipeline
 from retrieval import BM25Index, CrossEncoderReranker, HybridRetriever
 from rewriter import QueryRewriter
 from critic import CriticAndRepair
+from web_store import WebChunkStore
 
 log = logging.getLogger(__name__)
 
@@ -145,9 +146,10 @@ class ProductionRAGPipeline:
         self.critic   = CriticAndRepair(self.llm, cfg=cfg)
 
         # Retrieval components — wired in setup()
-        self.bm25:      Optional[BM25Index]            = None
-        self.reranker:  Optional[CrossEncoderReranker] = None
-        self.retriever: Optional[HybridRetriever]      = None
+        self.bm25:       Optional[BM25Index]            = None
+        self.reranker:   Optional[CrossEncoderReranker] = None
+        self.retriever:  Optional[HybridRetriever]      = None
+        self.web_store:  Optional[WebChunkStore]        = None
 
         # Generation chain
         self._rag_chain = _RAG_PROMPT | self.llm | StrOutputParser()
@@ -186,6 +188,10 @@ class ProductionRAGPipeline:
         self.retriever = HybridRetriever(
             self.vectorstore, self.bm25, self.reranker, self.cfg
         )
+
+        # ── Persistent web chunk store ────────────────────────────────────
+        log.info("[Pipeline] Initialising persistent web chunk store...")
+        self.web_store = WebChunkStore(self.db, self.cfg, self.embeddings)
 
         log.info("[Pipeline] Setup complete — ready to query.")
         log.info("=" * 60)
@@ -438,13 +444,16 @@ class ProductionRAGPipeline:
     def monitoring_report(self, last_n: int = 50) -> dict:
         """
         Combined report across all subsystems.
-        Returns metrics, cache stats, and rewriter pool health.
+        Returns metrics, cache stats, rewriter pool health, and web store stats.
         """
-        return {
+        report = {
             "performance": self.metrics.report(last_n),
             "cache":       self.cache.stats(),
             "rewriter":    self.rewriter.rewrite_stats(),
         }
+        if self.web_store is not None:
+            report["web_store"] = self.web_store.stats()
+        return report
 
     def trigger_drift_check(self) -> Optional[str]:
         """Manually run the drift detector. Returns alert string or None."""
@@ -479,11 +488,19 @@ class ProductionRAGPipeline:
 
     def _web_scrape_chunks(self, query: str) -> list[dict]:
         """
-        DDG search → domain-score → scrape approved URLs →
-        embed into temp Chroma → similarity-search for best chunks.
-        Returns a list of chunk dicts compatible with the main pipeline.
+        DDG search → domain-score → scrape new URLs → upsert to persistent
+        WebChunkStore → similarity-search the full store for the query.
+
+        Key changes from the old temp-store approach:
+          - No more in-memory Chroma collection created and destroyed per query.
+          - URLs already scraped within the TTL window are skipped (no re-embedding).
+          - The search covers ALL cached web content, not just this query's pages —
+            previous queries may have already cached highly relevant content.
+          - All web chunks persist to ./chroma_web/ and survive program restarts.
         """
-        log.info(f"[WebFallback] Searching DDG for: '{query}'")
+        assert self.web_store is not None, "Call await setup() before query()."
+
+        log.info(f"[WebScrape] Querying DDG: '{query}'")
         raw = []
         for attempt in range(self.cfg.ddg_retries):
             try:
@@ -493,68 +510,35 @@ class ProductionRAGPipeline:
                     break
                 time.sleep(2 ** attempt)
             except Exception as e:
-                log.warning(f"[WebFallback] DDG attempt {attempt+1} failed: {e}")
+                log.warning(f"[WebScrape] DDG attempt {attempt+1} failed: {e}")
                 time.sleep(2 ** attempt)
 
         if not raw:
-            log.warning("[WebFallback] No DDG results.")
-            return []
-
-        # Filter by domain score
-        approved = sorted(
-            [r for r in raw if _score_domain(r["href"]) >= self.cfg.min_domain_score],
-            key=lambda r: _score_domain(r["href"]),
-            reverse=True,
-        )
-        if not approved:
-            log.warning("[WebFallback] All URLs below domain score threshold.")
-            return []
-
-        log.info(f"[WebFallback] Approved {len(approved)}/{len(raw)} URLs")
-
-        # Scrape each URL
-        scraped_docs: list[Document] = []
-        for r in approved:
-            url, title = r["href"], r.get("title", "Web")
-            text = self._scrape_url(url)
-            if text and not text.startswith("Error:"):
-                scraped_docs.append(
-                    Document(
-                        page_content=text,
-                        metadata={"source": url, "title": title},
-                    )
-                )
-                log.info(f"[WebFallback] Scraped: {url[:60]}")
-
-        if not scraped_docs:
-            return []
-
-        # Chunk scraped content
-        splitter    = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
-        web_chunks  = splitter.split_documents(scraped_docs)
-
-        # Embed into a temporary in-memory Chroma collection
-        try:
-            temp_store = Chroma.from_documents(
-                documents=web_chunks,
-                embedding=self.embeddings,
+            log.warning("[WebScrape] No DDG results — searching existing cache only.")
+        else:
+            # Domain-score and filter candidate URLs
+            approved = sorted(
+                [r for r in raw if _score_domain(r["href"]) >= self.cfg.min_domain_score],
+                key=lambda r: _score_domain(r["href"]),
+                reverse=True,
             )
-            results = temp_store.similarity_search_with_score(query, k=4)
-        except Exception as e:
-            log.error(f"[WebFallback] Temp store error: {e}")
-            return []
+            log.info(f"[WebScrape] Approved {len(approved)}/{len(raw)} URLs")
 
-        # Convert to pipeline chunk format
-        return [
-            {
-                "text":         doc.page_content,
-                "filename":     doc.metadata.get("source", "web"),
-                "page_number":  0,
-                "rerank_score": round(float(1 - score), 3),
-                "source_type":  "web",
-            }
-            for doc, score in results
-        ]
+            # Scrape and upsert only URLs not already fresh in the store
+            new_chunks = 0
+            for r in approved:
+                url, title = r["href"], r.get("title", "Web")
+                if self.web_store.is_fresh(url):
+                    log.info(f"[WebScrape] Cache hit (TTL fresh): {url[:60]}")
+                    continue
+                text = self._scrape_url(url)
+                stored = self.web_store.upsert(url, title, text)
+                new_chunks += stored
+
+            log.info(f"[WebScrape] {new_chunks} new chunks added to persistent store")
+
+        # Search the entire persistent store (not just this query's pages)
+        return self.web_store.search(query, k=self.cfg.web_top_k)
 
     def _scrape_url(self, url: str, char_limit: int = 2500) -> str:
         try:

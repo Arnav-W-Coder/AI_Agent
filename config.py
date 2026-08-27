@@ -53,8 +53,22 @@ class RAGConfig:
     max_scrape_urls:   int  = 5
     ddg_retries:       int  = 3
     min_domain_score:  int  = 30
-    web_top_k:         int  = 4     # web chunks kept after temp-store similarity search
+    web_top_k:         int  = 6     # chunks returned from web store per query
     always_scrape_web: bool = True  # True → parallel PDF+web always; False → fallback only
+
+    # ── Web chunk persistence (replaces in-memory temp store) ─────────────────
+    web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
+    # Dedicated ChromaDB collection for web content. Separate from PDF store so
+    # PDF retrieval quality is never diluted by web chunks during index operations.
+
+    web_chunk_ttl_hours: int = 24
+    # Hours before a scraped URL is considered stale and eligible for eviction.
+    # Increase for stable reference sites (Wikipedia); decrease for news/live data.
+
+    web_collection_max_chunks: int = 8000
+    # Hard cap on total chunks in the web store. When 90% full, the oldest 20%
+    # of URLs (by scrape time) are evicted. Prevents unbounded disk/index growth.
+    # At ~2 KB per chunk: 8000 chunks ≈ 16 MB of text + ChromaDB index overhead.
 
     # ── Critic thresholds ─────────────────────────────────────────────────────
     # All formerly hardcoded — change here without touching critic.py or pipeline.py
