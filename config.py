@@ -8,11 +8,10 @@ from pathlib import Path
 
 @dataclass
 class RAGConfig:
-
     # ── Models ────────────────────────────────────────────────────────────────
-    embed_model:  str = "nomic-embed-text"          # Ollama embedding model
-    llm_model:    str = "llama3.2"                  # Ollama generation model
-    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # HF cross-encoder
+    embed_model:  str = "nomic-embed-text"
+    llm_model:    str = "llama3.2"
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     docs_dir:   Path = field(default_factory=lambda: Path("./docs"))
@@ -22,69 +21,62 @@ class RAGConfig:
     # ── LLM ───────────────────────────────────────────────────────────────────
     ctx_window: int = 16384
 
-    # ── Chunking ──────────────────────────────────────────────────────────────
-    chunk_size:    int = 800
+    # ── Hierarchical chunking ─────────────────────────────────────────────────
+    # Structure-aware sectioning is followed by semantic grouping, then a hard
+    # recursive cap. Parents are context units; children are retrieval units.
+    semantic_chunking_enabled: bool = True
+    semantic_breakpoint_percentile: float = 75.0
+    semantic_min_distance: float = 0.10
+    semantic_min_paragraph_tokens: int = 20
+    semantic_min_block_tokens: int = 80
+    parent_target_tokens: int = 900
+    parent_max_tokens: int = 1200
+    child_max_tokens: int = 220
+    child_overlap_tokens: int = 30
+    context_budget_tokens: int = 7000
+    context_neighbor_count: int = 1
+
+    # Legacy aliases retained for compatibility with older callers.
+    chunk_size: int = 800
     chunk_overlap: int = 150
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
-    top_k_dense:      int   = 20    # dense ANN candidates before rerank
-    top_k_sparse:     int   = 20    # BM25 candidates before rerank
-    top_k_rerank:     int   = 5     # final chunks after cross-encoder rerank
-    rrf_k:            int   = 60    # RRF constant (60 is the standard)
-    min_rerank_score: float = -8.0  # drop chunks scoring below this
+    top_k_dense:      int   = 20
+    top_k_sparse:     int   = 20
+    top_k_rerank:     int   = 5
+    rrf_k:            int   = 60
+    min_rerank_score: float = -8.0
 
     # ── Caching ───────────────────────────────────────────────────────────────
-    answer_ttl:              int   = 3600   # seconds before answer cache expires
-    retrieval_ttl:           int   = 1800   # seconds before retrieval cache expires
-    answer_sim_threshold:    float = 0.92   # cosine sim for semantic answer cache hit
-    retrieval_sim_threshold: float = 0.97   # cosine sim for retrieval cache hit
+    answer_ttl:              int   = 3600
+    retrieval_ttl:           int   = 1800
+    answer_sim_threshold:    float = 0.92
+    retrieval_sim_threshold: float = 0.97
 
     # ── Ingestion ─────────────────────────────────────────────────────────────
-    embed_batch_size: int = 16   # chunks per embedding API call
-    ingest_workers:   int = 4    # parallel PDF loaders
+    embed_batch_size: int = 16
+    ingest_workers:   int = 4
 
     # ── Monitoring / drift ────────────────────────────────────────────────────
-    drift_window:        int   = 50    # queries per drift-check window
-    drift_threshold:     float = 0.12  # fractional drop in mean score → re-embed
-    min_retrieval_score: float = 0.20  # below this flags poor retrieval in logs
-    latency_warn_ms:     int   = 6000  # log warning if total latency > this
+    drift_window:        int   = 50
+    drift_threshold:     float = 0.12
+    min_retrieval_score: float = 0.20
+    latency_warn_ms:     int   = 6000
 
     # ── Web scraping ──────────────────────────────────────────────────────────
-    max_scrape_urls:   int  = 5
-    ddg_retries:       int  = 3
-    min_domain_score:  int  = 30
-    web_top_k:         int  = 6     # chunks returned from web store per query
-    always_scrape_web: bool = True  # True → parallel PDF+web always; False → fallback only
-
-    # ── Web chunk persistence (replaces in-memory temp store) ─────────────────
+    max_scrape_urls:   int = 5
+    ddg_retries:       int = 3
+    min_domain_score:  int = 30
+    web_top_k:         int = 6
+    always_scrape_web: bool = True
     web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
-    # Dedicated ChromaDB collection for web content. Separate from PDF store so
-    # PDF retrieval quality is never diluted by web chunks during index operations.
-
     web_chunk_ttl_hours: int = 24
-    # Hours before a scraped URL is considered stale and eligible for eviction.
-    # Increase for stable reference sites (Wikipedia); decrease for news/live data.
-
     web_collection_max_chunks: int = 8000
-    # Hard cap on total chunks in the web store. When 90% full, the oldest 20%
-    # of URLs (by scrape time) are evicted. Prevents unbounded disk/index growth.
-    # At ~2 KB per chunk: 8000 chunks ≈ 16 MB of text + ChromaDB index overhead.
 
     # ── Critic thresholds ─────────────────────────────────────────────────────
-    # All formerly hardcoded — change here without touching critic.py or pipeline.py
     critic_uncertainty_threshold: float = 0.50
-    # Ratio of hedge sentences in an answer before it is auto-accepted as
-    # "I don't know". Lower = stricter (more answers sent to LLM critic).
-    # 0.50 means half the sentences must be hedges; 0.33 means one in three.
-
     critic_claim_penalty: float = 0.20
-    # Faithfulness score deducted per unsupported claim found by the critic.
-    # score = max(0, 1.0 - penalty × num_claims). Lower = more lenient.
-    # 0.20 → 1 claim = 0.80, 2 claims = 0.60, 5+ claims = 0.0.
 
     # ── Rewriter auto-labeling ────────────────────────────────────────────────
-    rewriter_helpful_min_score:    float = 0.80
-    # Faithfulness score >= this → rewrite is auto-labeled helpful (enters few-shot pool).
-    rewriter_unhelpful_max_score:  float = 0.40
-    # Faithfulness score <  this → rewrite is auto-labeled unhelpful (excluded from pool).
-    # Scores between the two thresholds receive no auto-label (neutral; awaits user rating).
+    rewriter_helpful_min_score: float = 0.80
+    rewriter_unhelpful_max_score: float = 0.40
