@@ -2,19 +2,16 @@
 chunking.py — structure-aware, semantic-recursive hierarchical chunking.
 """
 from __future__ import annotations
-
 import logging
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
-
 import numpy as np
 import tiktoken
 from langchain_core.documents import Document
 
 log = logging.getLogger(__name__)
-
 
 @dataclass
 class Section:
@@ -23,7 +20,6 @@ class Section:
     text: str
     start_page: int
     end_page: int
-
 
 @dataclass
 class ChunkRecord:
@@ -37,10 +33,8 @@ class ChunkRecord:
     section_path: str
     metadata: dict = field(default_factory=dict)
 
-
 class HierarchicalChunker:
     """Structure boundary -> semantic split -> recursive cap -> parent/child."""
-
     def __init__(self, cfg, embedding_fn: Callable[[list[str]], list[list[float]]]):
         self.cfg = cfg
         self.embedding_fn = embedding_fn
@@ -59,9 +53,7 @@ class HierarchicalChunker:
         line = line.strip()
         if not line or len(line) > 140:
             return False
-        if line.startswith("#"):
-            return True
-        if re.match(r"^(?:chapter|section|part|appendix)\b", line, re.I):
+        if line.startswith("#") or re.match(r"^(?:chapter|section|part|appendix)\b", line, re.I):
             return True
         if re.match(r"^\d+(?:\.\d+){0,3}[.)]?\s+\S+", line):
             return len(line.split()) <= 14
@@ -80,27 +72,23 @@ class HierarchicalChunker:
 
     def _structure_sections(self, pages: Sequence[Document]) -> list[Section]:
         sections: list[Section] = []
-        current_title = "Document"
-        current_path = "Document"
-        current_lines: list[str] = []
-        current_start = 1
-        current_end = 1
+        title, path = "Document", "Document"
+        lines: list[str] = []
+        start = end = 1
         hierarchy: dict[int, str] = {}
-
-        def flush() -> None:
-            nonlocal current_lines
-            text = "\n".join(current_lines).strip()
+        def flush():
+            nonlocal lines
+            text = "\n".join(lines).strip()
             if text:
-                sections.append(Section(current_title, current_path, text, current_start, current_end))
-            current_lines = []
-
+                sections.append(Section(title, path, text, start, end))
+            lines = []
         for page_idx, page in enumerate(pages):
             page_no = int(page.metadata.get("page", page_idx)) + 1
             for raw in page.page_content.replace("\r", "").splitlines():
                 line = re.sub(r"[ \t]+", " ", raw).strip()
                 if not line:
-                    if current_lines and current_lines[-1] != "":
-                        current_lines.append("")
+                    if lines and lines[-1] != "":
+                        lines.append("")
                     continue
                 if self._looks_like_heading(line):
                     flush()
@@ -109,15 +97,14 @@ class HierarchicalChunker:
                     for key in list(hierarchy):
                         if key > level:
                             del hierarchy[key]
-                    current_title = hierarchy[level]
-                    current_path = " > ".join(hierarchy[k] for k in sorted(hierarchy))
-                    current_start = page_no
-                    current_end = page_no
+                    title = hierarchy[level]
+                    path = " > ".join(hierarchy[k] for k in sorted(hierarchy))
+                    start = end = page_no
                     continue
-                if not current_lines:
-                    current_start = page_no
-                current_end = page_no
-                current_lines.append(line)
+                if not lines:
+                    start = page_no
+                end = page_no
+                lines.append(line)
         flush()
         if not sections:
             text = "\n".join(p.page_content for p in pages).strip()
@@ -126,11 +113,7 @@ class HierarchicalChunker:
 
     @staticmethod
     def _paragraphs(text: str) -> list[str]:
-        return [
-            re.sub(r"\s+", " ", b).strip()
-            for b in re.split(r"\n\s*\n+", text)
-            if b.strip()
-        ]
+        return [re.sub(r"\s+", " ", b).strip() for b in re.split(r"\n\s*\n+", text) if b.strip()]
 
     def _semantic_blocks(self, paragraphs: list[str]) -> list[str]:
         if len(paragraphs) <= 1 or not self.cfg.semantic_chunking_enabled:
@@ -139,25 +122,15 @@ class HierarchicalChunker:
             vectors = np.asarray(self.embedding_fn(paragraphs), dtype=np.float32)
             vectors /= np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-8)
             distances = 1.0 - np.sum(vectors[:-1] * vectors[1:], axis=1)
-            threshold = max(
-                float(np.percentile(distances, self.cfg.semantic_breakpoint_percentile)),
-                self.cfg.semantic_min_distance,
-            )
+            threshold = max(float(np.percentile(distances, self.cfg.semantic_breakpoint_percentile)), self.cfg.semantic_min_distance)
         except Exception as exc:
             log.warning("[Chunking] Semantic boundary detection failed: %s", exc)
             return paragraphs
-
-        blocks: list[str] = []
-        current: list[str] = []
+        blocks, current = [], []
         for i, paragraph in enumerate(paragraphs):
             current.append(paragraph)
-            if (
-                i < len(paragraphs) - 1
-                and distances[i] >= threshold
-                and self._tokens("\n\n".join(current)) >= self.cfg.semantic_min_block_tokens
-            ):
-                blocks.append("\n\n".join(current))
-                current = []
+            if i < len(paragraphs) - 1 and distances[i] >= threshold and self._tokens("\n\n".join(current)) >= self.cfg.semantic_min_block_tokens:
+                blocks.append("\n\n".join(current)); current = []
         if current:
             blocks.append("\n\n".join(current))
         return blocks
@@ -171,13 +144,11 @@ class HierarchicalChunker:
         if len(pieces) == 1:
             words = text.split()
             return [" ".join(words[i:i + max_tokens]) for i in range(0, len(words), max_tokens)]
-        out: list[str] = []
-        current: list[str] = []
+        out, current = [], []
         for piece in pieces:
             candidate = "\n\n".join(current + [piece])
             if current and self._tokens(candidate) > max_tokens:
-                out.extend(self._recursive_cap("\n\n".join(current), max_tokens))
-                current = [piece]
+                out.extend(self._recursive_cap("\n\n".join(current), max_tokens)); current = [piece]
             else:
                 current.append(piece)
         if current:
@@ -185,13 +156,11 @@ class HierarchicalChunker:
         return out
 
     def _make_parents(self, section: Section) -> list[str]:
-        parents: list[str] = []
-        current: list[str] = []
+        parents, current = [], []
         for block in self._semantic_blocks(self._paragraphs(section.text)):
             candidate = "\n\n".join(current + [block])
             if current and self._tokens(candidate) > self.cfg.parent_target_tokens:
-                parents.extend(self._recursive_cap("\n\n".join(current), self.cfg.parent_max_tokens))
-                current = [block]
+                parents.extend(self._recursive_cap("\n\n".join(current), self.cfg.parent_max_tokens)); current = [block]
             else:
                 current.append(block)
         if current:
@@ -202,34 +171,30 @@ class HierarchicalChunker:
         pieces = self._recursive_cap(text, self.cfg.child_max_tokens)
         if self.cfg.child_overlap_tokens <= 0:
             return pieces
-        out: list[str] = []
+        out = []
         for i, piece in enumerate(pieces):
             if i == 0:
                 out.append(piece)
-                continue
-            overlap = " ".join(pieces[i - 1].split()[-self.cfg.child_overlap_tokens:])
-            out.append((overlap + "\n" + piece).strip())
+            else:
+                overlap = " ".join(pieces[i - 1].split()[-self.cfg.child_overlap_tokens:])
+                out.append((overlap + "\n" + piece).strip())
         return out
 
     def chunk(self, pages: Sequence[Document], doc_id: str) -> tuple[list[ChunkRecord], list[ChunkRecord]]:
-        parents: list[ChunkRecord] = []
-        children: list[ChunkRecord] = []
+        parents, children = [], []
         parent_index = child_index = 0
         for section in self._structure_sections(pages):
             for parent_text in self._make_parents(section):
                 parent_id = str(uuid.uuid4())
                 contextual = f"{section.path}\n\n{parent_text}" if section.path else parent_text
-                parents.append(ChunkRecord(
-                    id=parent_id, text=contextual, chunk_type="parent", chunk_index=parent_index,
-                    parent_id=None, start_page=section.start_page, end_page=section.end_page,
-                    section_path=section.path, metadata={"doc_id": doc_id},
-                ))
+                # Negative indices keep parent and child namespaces distinct while
+                # preserving adjacency for neighbor lookup in SQLite.
+                parents.append(ChunkRecord(parent_id, contextual, "parent", -(parent_index + 1), None,
+                                            section.start_page, section.end_page, section.path, {"doc_id": doc_id}))
                 for child_text in self._make_children(contextual):
-                    children.append(ChunkRecord(
-                        id=str(uuid.uuid4()), text=child_text, chunk_type="child", chunk_index=child_index,
-                        parent_id=parent_id, start_page=section.start_page, end_page=section.end_page,
-                        section_path=section.path, metadata={"doc_id": doc_id, "parent_id": parent_id},
-                    ))
+                    children.append(ChunkRecord(str(uuid.uuid4()), child_text, "child", child_index,
+                                                parent_id, section.start_page, section.end_page, section.path,
+                                                {"doc_id": doc_id, "parent_id": parent_id}))
                     child_index += 1
                 parent_index += 1
         return parents, children
