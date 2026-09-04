@@ -1,12 +1,9 @@
 """
-ingestion.py — Async, batched PDF ingestion pipeline.
+ingestion.py — Async, batched PDF ingestion with hierarchical chunking.
 
-Design:
-  - Offline and async: scans ./docs, skips already-ingested files (via MD5 hash)
-  - Loads PDFs in parallel using ThreadPoolExecutor (IO + CPU bound)
-  - Embeds in batches of embed_batch_size to avoid OOM
-  - Stores metadata in SQLite alongside vectors in ChromaDB
-  - Builds/rebuilds the BM25 index after every ingestion run
+PDFs are split into structural sections, semantic blocks, bounded parents, and
+small retrieval children. Only children are embedded/indexed; parents remain in
+SQLite for context expansion after retrieval.
 """
 import asyncio
 import hashlib
@@ -19,13 +16,13 @@ from pathlib import Path
 from typing import Optional
 
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from config import RAGConfig
 from db import Database
+from chunking import HierarchicalChunker, ChunkRecord
 
 log = logging.getLogger(__name__)
 
@@ -33,182 +30,159 @@ log = logging.getLogger(__name__)
 def _file_hash(path: Path) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
     return h.hexdigest()
 
 
 def _load_pdf(path: Path) -> tuple[list[Document], int]:
-    """Load a single PDF; returns (pages, page_count)."""
     loader = PyPDFLoader(str(path))
-    pages  = loader.load()
+    pages = loader.load()
     return pages, len(pages)
 
 
 class AsyncIngestionPipeline:
-    """
-    Async ingestion pipeline. Call `run()` to ingest all PDFs in docs_dir.
-    Skips files whose MD5 hash hasn't changed since last ingestion.
-    """
-
-    def __init__(
-        self,
-        db: Database,
-        cfg: RAGConfig,
-        vectorstore: Chroma,
-        embeddings: OllamaEmbeddings,
-    ) -> None:
-        self.db          = db
-        self.cfg         = cfg
+    def __init__(self, db: Database, cfg: RAGConfig, vectorstore: Chroma, embeddings: OllamaEmbeddings) -> None:
+        self.db = db
+        self.cfg = cfg
         self.vectorstore = vectorstore
-        self.embeddings  = embeddings
-        self.splitter    = RecursiveCharacterTextSplitter(
-            chunk_size=cfg.chunk_size,
-            chunk_overlap=cfg.chunk_overlap,
-        )
+        self.embeddings = embeddings
+        self.chunker = HierarchicalChunker(cfg, self.embeddings.embed_documents)
 
     def _already_ingested(self, filepath: Path, file_hash: str) -> bool:
         with self.db.connect() as conn:
             row = conn.execute(
-                "SELECT file_hash FROM documents WHERE filepath = ?",
-                (str(filepath),)
+                "SELECT file_hash FROM documents WHERE filepath = ?", (str(filepath),)
             ).fetchone()
         return row is not None and row["file_hash"] == file_hash
 
-    async def _load_pdf_async(
-        self, path: Path, executor: ThreadPoolExecutor
-    ) -> tuple[list[Document], int]:
+    async def _load_pdf_async(self, path: Path, executor: ThreadPoolExecutor) -> tuple[list[Document], int]:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(executor, _load_pdf, path)
 
-    async def _embed_batch(
-        self, chunks: list[Document], doc_id: str, executor: ThreadPoolExecutor
-    ) -> None:
-        """Embed one batch of chunks and upsert into ChromaDB + SQLite."""
-        loop   = asyncio.get_event_loop()
-        texts  = [c.page_content for c in chunks]
+    def _remove_old_document(self, filepath: Path) -> None:
+        """Remove stale vectors/rows before replacing a changed document."""
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, chroma_id FROM chunks WHERE doc_id IN "
+                "(SELECT id FROM documents WHERE filepath = ?)", (str(filepath),)
+            ).fetchall()
+            doc_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM documents WHERE filepath = ?", (str(filepath),)
+            ).fetchall()]
+        if rows:
+            try:
+                self.vectorstore._collection.delete(ids=[r["chroma_id"] for r in rows])
+            except Exception as exc:
+                log.warning("[Ingestion] Could not remove old Chroma vectors: %s", exc)
+        if doc_ids:
+            with self.db.connect() as conn:
+                conn.executemany("DELETE FROM chunks WHERE doc_id = ?", [(d,) for d in doc_ids])
+                conn.executemany("DELETE FROM documents WHERE id = ?", [(d,) for d in doc_ids])
 
-        # Embed via Ollama (blocking HTTP call → offload to thread)
-        embeddings_list = await loop.run_in_executor(
-            executor, self.embeddings.embed_documents, texts
-        )
-
-        # Build Chroma documents with metadata
-        chroma_ids  = [str(uuid.uuid4()) for _ in chunks]
-        metadatas   = []
-        for i, chunk in enumerate(chunks):
-            meta = dict(chunk.metadata)
-            meta["doc_id"] = doc_id
-            metadatas.append(meta)
-
-        # Upsert into ChromaDB
+    async def _embed_batch(self, chunks: list[ChunkRecord], doc_id: str, executor: ThreadPoolExecutor) -> None:
+        loop = asyncio.get_event_loop()
+        texts = [c.text for c in chunks]
+        vectors = await loop.run_in_executor(executor, self.embeddings.embed_documents, texts)
+        chroma_ids = [str(uuid.uuid4()) for _ in chunks]
+        metadatas = []
+        for chunk in chunks:
+            metadatas.append({
+                "doc_id": doc_id,
+                "parent_id": chunk.parent_id or "",
+                "chunk_type": "child",
+                "source": chunk.metadata.get("source", ""),
+                "page": chunk.start_page,
+                "end_page": chunk.end_page,
+                "section_path": chunk.section_path,
+            })
         self.vectorstore._collection.upsert(
-            ids=chroma_ids,
-            documents=texts,
-            embeddings=embeddings_list,
-            metadatas=metadatas,
+            ids=chroma_ids, documents=texts, embeddings=vectors, metadatas=metadatas
         )
-
-        # Store chunk metadata in SQLite
         with self.db.connect() as conn:
             for i, (chroma_id, chunk) in enumerate(zip(chroma_ids, chunks)):
-                chunk_id = str(uuid.uuid4())
                 conn.execute(
-                    """INSERT OR IGNORE INTO chunks
-                       (id, doc_id, chroma_id, chunk_index, page_number, text_preview)
-                       VALUES (?,?,?,?,?,?)""",
-                    (
-                        chunk_id, doc_id, chroma_id, i,
-                        chunk.metadata.get("page", 0),
-                        chunk.page_content[:200],
-                    )
+                    """INSERT INTO chunks
+                       (id, doc_id, chroma_id, chunk_index, page_number, text_preview,
+                        text, chunk_type, parent_id, end_page, section_path)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (chunk.id, doc_id, chroma_id, chunk.chunk_index, chunk.start_page,
+                     chunk.text[:200], chunk.text, "child", chunk.parent_id,
+                     chunk.end_page, chunk.section_path),
                 )
 
-    async def _ingest_file(
-        self, path: Path, executor: ThreadPoolExecutor
-    ) -> Optional[dict]:
-        """Ingest a single PDF file. Returns summary dict or None if skipped."""
+    def _store_parents(self, parents: list[ChunkRecord], doc_id: str, source: str) -> None:
+        with self.db.connect() as conn:
+            for parent in parents:
+                conn.execute(
+                    """INSERT INTO chunks
+                       (id, doc_id, chroma_id, chunk_index, page_number, text_preview,
+                        text, chunk_type, parent_id, end_page, section_path)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (parent.id, doc_id, "", parent.chunk_index, parent.start_page,
+                     parent.text[:200], parent.text, "parent", None, parent.end_page, parent.section_path),
+                )
+
+    async def _ingest_file(self, path: Path, executor: ThreadPoolExecutor) -> Optional[dict]:
         file_hash = _file_hash(path)
-
         if self._already_ingested(path, file_hash):
-            log.info(f"[Ingestion] Skipping (unchanged): {path.name}")
+            log.info("[Ingestion] Skipping (unchanged): %s", path.name)
             return None
 
-        log.info(f"[Ingestion] Processing: {path.name}")
+        log.info("[Ingestion] Processing: %s", path.name)
         t0 = time.time()
-
         pages, page_count = await self._load_pdf_async(path, executor)
-        chunks = self.splitter.split_documents(pages)
-
-        if not chunks:
-            log.warning(f"[Ingestion] No chunks produced from {path.name}")
+        doc_id = str(uuid.uuid4())
+        parents, children = self.chunker.chunk(pages, doc_id)
+        if not parents or not children:
+            log.warning("[Ingestion] No hierarchical chunks produced from %s", path.name)
             return None
 
-        doc_id = str(uuid.uuid4())
-
-        # Register document in SQLite before embedding (so FK refs work)
+        self._remove_old_document(path)
         with self.db.connect() as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO documents
-                   (id, filename, filepath, file_hash, page_count,
-                    chunk_count, ingested_at, metadata_json)
+                """INSERT INTO documents
+                   (id, filename, filepath, file_hash, page_count, chunk_count, ingested_at, metadata_json)
                    VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    doc_id, path.name, str(path), file_hash,
-                    page_count, len(chunks), time.time(),
-                    json.dumps({"source": str(path)}),
-                )
+                (doc_id, path.name, str(path), file_hash, page_count, len(children), time.time(),
+                 json.dumps({"source": str(path), "chunking": "hierarchical-semantic"})),
             )
 
-        # Embed in batches
+        for parent in parents:
+            parent.metadata["source"] = str(path)
+        self._store_parents(parents, doc_id, str(path))
+        for child in children:
+            child.metadata["source"] = str(path)
+
         batch_size = self.cfg.embed_batch_size
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i : i + batch_size]
-            log.info(
-                f"[Ingestion] {path.name} — embedding batch "
-                f"{i//batch_size + 1}/{-(-len(chunks)//batch_size)}"
-            )
+        for i in range(0, len(children), batch_size):
+            batch = children[i:i + batch_size]
             await self._embed_batch(batch, doc_id, executor)
 
         elapsed = time.time() - t0
-        log.info(
-            f"[Ingestion] ✓ {path.name}: {page_count} pages, "
-            f"{len(chunks)} chunks in {elapsed:.1f}s"
-        )
+        log.info("[Ingestion] ✓ %s: %d pages, %d parents, %d children in %.1fs",
+                 path.name, page_count, len(parents), len(children), elapsed)
         return {
-            "filename":    path.name,
-            "pages":       page_count,
-            "chunks":      len(chunks),
-            "elapsed_s":   round(elapsed, 1),
+            "filename": path.name, "pages": page_count, "parents": len(parents),
+            "children": len(children), "chunks": len(children), "elapsed_s": round(elapsed, 1),
         }
 
     async def run(self) -> list[dict]:
-        """
-        Scan docs_dir, ingest all new/changed PDFs concurrently.
-        Returns list of ingestion summaries.
-        """
         docs_dir = Path(self.cfg.docs_dir)
-        pdfs     = list(docs_dir.glob("**/*.pdf"))
-
+        pdfs = list(docs_dir.glob("**/*.pdf"))
         if not pdfs:
-            log.warning(f"[Ingestion] No PDFs found in {docs_dir}")
+            log.warning("[Ingestion] No PDFs found in %s", docs_dir)
             return []
 
-        log.info(f"[Ingestion] Found {len(pdfs)} PDFs in {docs_dir}")
-        summaries = []
-
+        summaries: list[dict] = []
         with ThreadPoolExecutor(max_workers=self.cfg.ingest_workers) as executor:
             tasks = [self._ingest_file(p, executor) for p in pdfs]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in results:
-            if isinstance(r, Exception):
-                log.error(f"[Ingestion] Error: {r}")
-            elif r is not None:
-                summaries.append(r)
-
-        log.info(
-            f"[Ingestion] Complete: {len(summaries)} new files ingested, "
-            f"{len(pdfs) - len(summaries)} skipped (unchanged)"
-        )
+        for result in results:
+            if isinstance(result, Exception):
+                log.error("[Ingestion] Error: %s", result)
+            elif result is not None:
+                summaries.append(result)
+        log.info("[Ingestion] Complete: %d new files ingested, %d skipped (unchanged)",
+                 len(summaries), len(pdfs) - len(summaries))
         return summaries
