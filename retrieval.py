@@ -1,19 +1,10 @@
 """
-retrieval.py — Hybrid retrieval: BM25 (sparse) + ChromaDB (dense) + reranking.
+retrieval.py — Hybrid child retrieval: BM25 + Chroma dense + RRF + reranking.
 
-Pipeline per query:
-  1. Metadata filter  — narrows ChromaDB search to matching documents
-  2. Dense ANN search — ChromaDB HNSW, top_k_dense candidates
-  3. Sparse BM25      — rank_bm25 on all indexed chunks, top_k_sparse candidates
-  4. RRF fusion       — merge both lists using Reciprocal Rank Fusion
-  5. Cross-encoder    — sentence-transformers reranks merged list, keep top_k_rerank
-
-BM25 index:
-  Built in-memory from all chunk texts stored in SQLite. Rebuilt after ingestion.
-  Lightweight for tens of thousands of chunks; for millions, switch to Elasticsearch.
+Retrieval operates on small child chunks. After reranking, the winning children
+are expanded to their parent context units so the LLM sees coherent sections.
 """
 import logging
-import json
 import re
 from typing import Optional
 
@@ -29,215 +20,193 @@ log = logging.getLogger(__name__)
 
 
 def _tokenize(text: str) -> list[str]:
-    """Simple whitespace + lowercase tokenizer for BM25."""
     return re.findall(r"\w+", text.lower())
 
 
 class BM25Index:
-    """
-    In-memory BM25 index over all chunk texts.
-    Rebuilt from SQLite on startup and after ingestion.
-    """
+    """In-memory BM25 index over the FULL text of retrieval children."""
 
     def __init__(self, db: Database) -> None:
         self.db = db
-        self._chunks: list[dict] = []   # [{chroma_id, text, doc_id, page}, ...]
-        self._bm25:   Optional[BM25Okapi] = None
+        self._chunks: list[dict] = []
+        self._bm25: Optional[BM25Okapi] = None
         self.rebuild()
 
     def rebuild(self) -> None:
         with self.db.connect() as conn:
             rows = conn.execute(
-                "SELECT c.chroma_id, c.text_preview, c.page_number, c.doc_id, "
-                "       d.filename "
-                "FROM chunks c JOIN documents d ON c.doc_id = d.id"
+                """SELECT c.chroma_id, c.text, c.text_preview, c.page_number,
+                          c.end_page, c.doc_id, c.parent_id, c.section_path,
+                          d.filename
+                   FROM chunks c JOIN documents d ON c.doc_id = d.id
+                   WHERE c.chunk_type = 'child' AND c.chroma_id <> ''"""
             ).fetchall()
-
         self._chunks = [dict(r) for r in rows]
-
         if not self._chunks:
             self._bm25 = None
-            log.info("[BM25] No chunks — index empty")
+            log.info("[BM25] No child chunks — index empty")
             return
-
-        corpus   = [_tokenize(c["text_preview"] or "") for c in self._chunks]
+        corpus = [_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks]
         self._bm25 = BM25Okapi(corpus)
-        log.info(f"[BM25] Index rebuilt: {len(self._chunks)} chunks")
+        log.info("[BM25] Index rebuilt: %d child chunks", len(self._chunks))
 
     def search(self, query: str, top_k: int) -> list[dict]:
-        """Returns list of {chroma_id, score, doc_id, filename, page_number}."""
         if self._bm25 is None or not self._chunks:
             return []
         tokens = _tokenize(query)
+        if not tokens:
+            return []
         scores = self._bm25.get_scores(tokens)
-        top_i  = np.argsort(scores)[::-1][:top_k]
+        top_i = np.argsort(scores)[::-1][:top_k]
         return [
-            {
-                **self._chunks[i],
-                "bm25_score": float(scores[i]),
-            }
-            for i in top_i
-            if scores[i] > 0
+            {**self._chunks[i], "bm25_score": float(scores[i])}
+            for i in top_i if scores[i] > 0
         ]
 
 
 class CrossEncoderReranker:
-    """
-    Wraps sentence-transformers CrossEncoder.
-    Downloads ~80MB model on first use (requires internet on first run only).
-    """
-
     def __init__(self, model_name: str) -> None:
-        log.info(f"[Reranker] Loading cross-encoder: {model_name}")
+        log.info("[Reranker] Loading cross-encoder: %s", model_name)
         self._model = CrossEncoder(model_name)
         log.info("[Reranker] Ready")
 
-    def rerank(
-        self, query: str, chunks: list[dict], top_k: int, min_score: float
-    ) -> list[dict]:
-        """
-        Score (query, passage) pairs and return top_k above min_score.
-        Adds 'rerank_score' key to each chunk dict.
-        """
+    def rerank(self, query: str, chunks: list[dict], top_k: int, min_score: float) -> list[dict]:
         if not chunks:
             return []
-
-        pairs  = [(query, c.get("text", c.get("text_preview", ""))) for c in chunks]
+        pairs = [(query, c.get("text", c.get("text_preview", ""))) for c in chunks]
         scores = self._model.predict(pairs).tolist()
-
         for chunk, score in zip(chunks, scores):
             chunk["rerank_score"] = round(float(score), 4)
-
-        ranked   = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
-        filtered = [c for c in ranked if c["rerank_score"] >= min_score]
-        return filtered[:top_k]
+        ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
+        return [c for c in ranked if c["rerank_score"] >= min_score][:top_k]
 
 
 class HybridRetriever:
-    """
-    Combines dense (ChromaDB) + sparse (BM25) search via RRF,
-    then reranks with a cross-encoder.
-
-    retrieve() returns:
-      - chunks:      final reranked list with 'text', 'rerank_score', metadata
-      - bm25_ids:    set of chroma_ids from BM25 (for overlap metric)
-      - dense_ids:   set of chroma_ids from dense search
-    """
-
-    def __init__(
-        self,
-        vectorstore: Chroma,
-        bm25_index:  BM25Index,
-        reranker:    CrossEncoderReranker,
-        cfg:         RAGConfig,
-    ) -> None:
-        self.vs      = vectorstore
-        self.bm25    = bm25_index
+    def __init__(self, vectorstore: Chroma, bm25_index: BM25Index,
+                 reranker: CrossEncoderReranker, cfg: RAGConfig) -> None:
+        self.vs = vectorstore
+        self.bm25 = bm25_index
         self.reranker = reranker
-        self.cfg     = cfg
+        self.cfg = cfg
+        self.db: Optional[Database] = None
+
+    def attach_database(self, db: Database) -> None:
+        """Attach SQLite so retrieval can expand children into parents."""
+        self.db = db
 
     def _rrf_score(self, rank: int) -> float:
         return 1.0 / (self.cfg.rrf_k + rank + 1)
 
-    def _dense_search(
-        self, query: str, top_k: int, metadata_filter: Optional[dict]
-    ) -> list[dict]:
-        """Query ChromaDB HNSW index with optional metadata filter."""
-        kwargs: dict = {"query_texts": [query], "n_results": top_k}
+    def _dense_search(self, query: str, top_k: int, metadata_filter: Optional[dict]) -> list[dict]:
+        kwargs = {"query_texts": [query], "n_results": top_k}
         if metadata_filter:
             kwargs["where"] = metadata_filter
-
         try:
             results = self.vs._collection.query(**kwargs)
-        except Exception as e:
-            log.error(f"[Dense] ChromaDB error: {e}")
+        except Exception as exc:
+            log.error("[Dense] ChromaDB error: %s", exc)
             return []
 
         chunks = []
-        ids_list  = results.get("ids",       [[]])[0]
-        docs_list = results.get("documents", [[]])[0]
-        metas     = results.get("metadatas", [[]])[0]
-        dists     = results.get("distances", [[]])[0]
-
-        for chroma_id, text, meta, dist in zip(ids_list, docs_list, metas, dists):
+        ids = results.get("ids", [[]])[0]
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+        dists = results.get("distances", [[]])[0]
+        for cid, text, meta, dist in zip(ids, docs, metas, dists):
+            meta = meta or {}
             chunks.append({
-                "chroma_id":    chroma_id,
-                "text":         text,
-                "doc_id":       (meta or {}).get("doc_id",   ""),
-                "filename":     (meta or {}).get("source",   ""),
-                "page_number":  (meta or {}).get("page",     0),
-                "dense_score":  round(1 - float(dist), 4),   # convert L2 → similarity
+                "chroma_id": cid,
+                "text": text or "",
+                "doc_id": meta.get("doc_id", ""),
+                "parent_id": meta.get("parent_id", ""),
+                "filename": meta.get("source", ""),
+                "page_number": meta.get("page", 0),
+                "end_page": meta.get("end_page", meta.get("page", 0)),
+                "section_path": meta.get("section_path", ""),
+                "chunk_type": "child",
+                "dense_score": round(1 - float(dist), 4),
             })
         return chunks
 
-    def retrieve(
-        self, query: str, metadata_filter: Optional[dict] = None
-    ) -> tuple[list[dict], set, set]:
-        """
-        Full hybrid retrieval pipeline.
-        Returns (reranked_chunks, bm25_chroma_ids, dense_chroma_ids).
-        """
-        # ── Dense ─────────────────────────────────────────────────────────────
-        dense_chunks = self._dense_search(query, self.cfg.top_k_dense, metadata_filter)
-        dense_ids    = {c["chroma_id"] for c in dense_chunks}
-
-        # ── Sparse (BM25) ─────────────────────────────────────────────────────
-        bm25_chunks = self.bm25.search(query, self.cfg.top_k_sparse)
-        bm25_ids    = {c["chroma_id"] for c in bm25_chunks}
-
-        log.info(
-            f"[Retrieval] Dense: {len(dense_chunks)} | "
-            f"BM25: {len(bm25_chunks)} | "
-            f"Overlap: {len(dense_ids & bm25_ids)}"
-        )
-
-        # ── RRF fusion ────────────────────────────────────────────────────────
-        # Assign each chunk an RRF score from whichever lists it appears in.
+    def _fuse(self, dense_chunks: list[dict], bm25_chunks: list[dict]) -> tuple[list[dict], set, set]:
+        dense_ids = {c["chroma_id"] for c in dense_chunks}
+        bm25_ids = {c["chroma_id"] for c in bm25_chunks}
         rrf: dict[str, dict] = {}
-
         for rank, chunk in enumerate(dense_chunks):
             cid = chunk["chroma_id"]
-            if cid not in rrf:
-                rrf[cid] = dict(chunk)
-                rrf[cid]["rrf_score"] = 0.0
+            rrf.setdefault(cid, {**chunk, "rrf_score": 0.0})
             rrf[cid]["rrf_score"] += self._rrf_score(rank)
-
         for rank, chunk in enumerate(bm25_chunks):
             cid = chunk["chroma_id"]
             if cid not in rrf:
-                # BM25 chunks may not have full text — fetch from Chroma
                 try:
-                    fetched = self.vs._collection.get(
-                        ids=[cid], include=["documents", "metadatas"]
-                    )
-                    text = fetched["documents"][0] if fetched["documents"] else \
-                           chunk.get("text_preview", "")
-                    meta = fetched["metadatas"][0] if fetched["metadatas"] else {}
+                    fetched = self.vs._collection.get(ids=[cid], include=["documents", "metadatas"])
+                    text = fetched.get("documents", [""])[0] if fetched.get("documents") else ""
+                    meta = fetched.get("metadatas", [{}])[0] if fetched.get("metadatas") else {}
                 except Exception:
-                    text = chunk.get("text_preview", "")
-                    meta = {}
+                    text, meta = chunk.get("text", chunk.get("text_preview", "")), {}
                 rrf[cid] = {
                     **chunk,
-                    "text":        text,
-                    "filename":    meta.get("source",   chunk.get("filename", "")),
-                    "page_number": meta.get("page",     chunk.get("page_number", 0)),
-                    "rrf_score":   0.0,
+                    "text": text,
+                    "filename": meta.get("source", chunk.get("filename", "")),
+                    "page_number": meta.get("page", chunk.get("page_number", 0)),
+                    "parent_id": meta.get("parent_id", chunk.get("parent_id", "")),
+                    "section_path": meta.get("section_path", chunk.get("section_path", "")),
+                    "rrf_score": 0.0,
                 }
             rrf[cid]["rrf_score"] += self._rrf_score(rank)
-
-        # Sort by RRF score, take top candidates for reranking
         candidates = sorted(rrf.values(), key=lambda c: c["rrf_score"], reverse=True)
-        candidates = candidates[: self.cfg.top_k_dense]  # cap before rerank
+        return candidates[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)], bm25_ids, dense_ids
 
-        # ── Cross-encoder rerank ───────────────────────────────────────────────
-        reranked = self.reranker.rerank(
-            query, candidates,
-            self.cfg.top_k_rerank,
-            self.cfg.min_rerank_score,
-        )
-
-        log.info(
-            f"[Rerank] {len(candidates)} → {len(reranked)} chunks | "
-            f"top score: {reranked[0]['rerank_score'] if reranked else 'n/a'}"
-        )
+    def retrieve(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
+        dense = self._dense_search(query, self.cfg.top_k_dense, metadata_filter)
+        bm25 = self.bm25.search(query, self.cfg.top_k_sparse)
+        candidates, bm25_ids, dense_ids = self._fuse(dense, bm25)
+        reranked = self.reranker.rerank(query, candidates, self.cfg.top_k_rerank, self.cfg.min_rerank_score)
         return reranked, bm25_ids, dense_ids
+
+    def retrieve_candidates(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
+        """Compatibility entry point used by pipeline.py; returns reranked children."""
+        return self.retrieve(query, metadata_filter)
+
+    def expand_to_context(self, children: list[dict]) -> list[dict]:
+        """Replace/augment winning children with their parent and nearby children.
+
+        Parent text is preferred because it preserves the semantic section. A small
+        number of adjacent children is included when available to bridge boundaries.
+        """
+        if not children or self.db is None:
+            return children
+        parent_ids = [c.get("parent_id") for c in children if c.get("parent_id")]
+        if not parent_ids:
+            return children
+        parent_ids = list(dict.fromkeys(parent_ids))
+        placeholders = ",".join("?" for _ in parent_ids)
+        with self.db.connect() as conn:
+            parents = conn.execute(
+                f"""SELECT id, doc_id, text, page_number, end_page, section_path
+                    FROM chunks WHERE chunk_type='parent' AND id IN ({placeholders})""",
+                parent_ids,
+            ).fetchall()
+            parent_map = {r["id"]: dict(r) for r in parents}
+
+            expanded: list[dict] = []
+            seen = set()
+            for child in children:
+                pid = child.get("parent_id")
+                parent = parent_map.get(pid)
+                if parent and pid not in seen:
+                    item = {
+                        **child,
+                        "text": parent["text"],
+                        "chunk_type": "parent_context",
+                        "parent_id": pid,
+                        "page_number": parent["page_number"],
+                        "end_page": parent["end_page"],
+                        "section_path": parent["section_path"],
+                    }
+                    expanded.append(item)
+                    seen.add(pid)
+                elif not parent:
+                    expanded.append(child)
+            return expanded
