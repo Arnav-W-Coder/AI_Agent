@@ -1,14 +1,15 @@
 """
 retrieval.py — Hybrid child retrieval: BM25 + Chroma dense + RRF + reranking.
 
-Retrieval operates on small child chunks. After reranking, the winning children
-are expanded to their parent context units so the LLM sees coherent sections.
+Retrieval operates on small child chunks. After reranking, winners expand to
+parent context units and nearby parent sections under a strict context budget.
 """
 import logging
 import re
 from typing import Optional
 
 import numpy as np
+import tiktoken
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 from langchain_chroma import Chroma
@@ -23,9 +24,15 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"\w+", text.lower())
 
 
+def _token_count(text: str) -> int:
+    try:
+        return len(tiktoken.get_encoding("cl100k_base").encode(text or ""))
+    except Exception:
+        return max(1, len((text or "").split()))
+
+
 class BM25Index:
     """In-memory BM25 index over the FULL text of retrieval children."""
-
     def __init__(self, db: Database) -> None:
         self.db = db
         self._chunks: list[dict] = []
@@ -46,8 +53,7 @@ class BM25Index:
             self._bm25 = None
             log.info("[BM25] No child chunks — index empty")
             return
-        corpus = [_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks]
-        self._bm25 = BM25Okapi(corpus)
+        self._bm25 = BM25Okapi([_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks])
         log.info("[BM25] Index rebuilt: %d child chunks", len(self._chunks))
 
     def search(self, query: str, top_k: int) -> list[dict]:
@@ -70,8 +76,7 @@ class CrossEncoderReranker:
     def rerank(self, query: str, chunks: list[dict], top_k: int, min_score: float) -> list[dict]:
         if not chunks:
             return []
-        pairs = [(query, c.get("text", c.get("text_preview", ""))) for c in chunks]
-        scores = self._model.predict(pairs).tolist()
+        scores = self._model.predict([(query, c.get("text", c.get("text_preview", ""))) for c in chunks]).tolist()
         for chunk, score in zip(chunks, scores):
             chunk["rerank_score"] = round(float(score), 4)
         ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
@@ -85,10 +90,8 @@ class HybridRetriever:
         self.bm25 = bm25_index
         self.reranker = reranker
         self.cfg = cfg
-        self.db: Optional[Database] = None
-
-    def attach_database(self, db: Database) -> None:
-        self.db = db
+        # BM25 already owns the canonical SQLite connection target.
+        self.db: Database = bm25_index.db
 
     def _rrf_score(self, rank: int) -> float:
         return 1.0 / (self.cfg.rrf_k + rank + 1)
@@ -103,17 +106,15 @@ class HybridRetriever:
             log.error("[Dense] ChromaDB error: %s", exc)
             return []
         chunks = []
-        ids = results.get("ids", [[]])[0]
-        docs = results.get("documents", [[]])[0]
-        metas = results.get("metadatas", [[]])[0]
-        dists = results.get("distances", [[]])[0]
-        for cid, text, meta, dist in zip(ids, docs, metas, dists):
+        for cid, text, meta, dist in zip(
+            results.get("ids", [[]])[0], results.get("documents", [[]])[0],
+            results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]
+        ):
             meta = meta or {}
             chunks.append({
                 "chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
                 "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
-                "page_number": meta.get("page", 0),
-                "end_page": meta.get("end_page", meta.get("page", 0)),
+                "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
                 "section_path": meta.get("section_path", ""), "chunk_type": "child",
                 "dense_score": round(1 - float(dist), 4),
             })
@@ -156,41 +157,70 @@ class HybridRetriever:
         return reranked, bm25_ids, dense_ids
 
     def retrieve_candidates(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
-        """Return reranked children expanded to coherent parent context units."""
         children, bm25_ids, dense_ids = self.retrieve(query, metadata_filter)
         return self.expand_to_context(children), bm25_ids, dense_ids
 
     def expand_to_context(self, children: list[dict]) -> list[dict]:
-        if not children or self.db is None:
-            return children
-        parent_ids = [c.get("parent_id") for c in children if c.get("parent_id")]
+        """Expand children to parents + adjacent parent sections within budget."""
+        if not children:
+            return []
+        parent_ids = list(dict.fromkeys(c.get("parent_id") for c in children if c.get("parent_id")))
         if not parent_ids:
             return children
-        parent_ids = list(dict.fromkeys(parent_ids))
         placeholders = ",".join("?" for _ in parent_ids)
         with self.db.connect() as conn:
-            parents = conn.execute(
-                f"""SELECT id, doc_id, text, page_number, end_page, section_path
-                    FROM chunks WHERE chunk_type='parent' AND id IN ({placeholders})""",
-                parent_ids,
+            rows = conn.execute(
+                f"""SELECT id, doc_id, chunk_index, text, page_number, end_page, section_path
+                    FROM chunks WHERE chunk_type='parent' AND id IN ({placeholders})""", parent_ids
             ).fetchall()
-            parent_map = {r["id"]: dict(r) for r in parents}
-            expanded: list[dict] = []
-            seen = set()
-            for child in children:
-                pid = child.get("parent_id")
-                parent = parent_map.get(pid)
-                if parent and pid not in seen:
-                    expanded.append({
-                        **child,
-                        "text": parent["text"],
-                        "chunk_type": "parent_context",
-                        "parent_id": pid,
-                        "page_number": parent["page_number"],
-                        "end_page": parent["end_page"],
-                        "section_path": parent["section_path"],
-                    })
-                    seen.add(pid)
-                elif not parent:
-                    expanded.append(child)
-            return expanded
+            parent_map = {r["id"]: dict(r) for r in rows}
+
+            # Preserve document-local ordering so neighbors are meaningful.
+            neighbors: list[dict] = []
+            for parent in rows:
+                for delta in range(1, self.cfg.context_neighbor_count + 1):
+                    for idx in (parent["chunk_index"] - delta, parent["chunk_index"] + delta):
+                        row = conn.execute(
+                            """SELECT id, doc_id, chunk_index, text, page_number, end_page, section_path
+                               FROM chunks WHERE chunk_type='parent' AND doc_id=? AND chunk_index=?""",
+                            (parent["doc_id"], idx),
+                        ).fetchone()
+                        if row:
+                            neighbors.append(dict(row))
+
+        selected: list[dict] = []
+        seen: set[str] = set()
+        budget = self.cfg.context_budget_tokens
+        for child in children:
+            pid = child.get("parent_id")
+            parent = parent_map.get(pid)
+            if not parent or pid in seen:
+                continue
+            tokens = _token_count(parent["text"])
+            if selected and sum(_token_count(x["text"]) for x in selected) + tokens > budget:
+                continue
+            if not selected and tokens > budget:
+                parent["text"] = " ".join(parent["text"].split()[:budget])
+            selected.append({
+                **child, "text": parent["text"], "chunk_type": "parent_context",
+                "parent_id": pid, "page_number": parent["page_number"],
+                "end_page": parent["end_page"], "section_path": parent["section_path"],
+            })
+            seen.add(pid)
+
+        # Neighbors are lower-priority context and never displace retrieved parents.
+        for neighbor in neighbors:
+            nid = neighbor["id"]
+            if nid in seen:
+                continue
+            used = sum(_token_count(x["text"]) for x in selected)
+            if used + _token_count(neighbor["text"]) > budget:
+                continue
+            selected.append({
+                "text": neighbor["text"], "filename": "", "page_number": neighbor["page_number"],
+                "end_page": neighbor["end_page"], "section_path": neighbor["section_path"],
+                "doc_id": neighbor["doc_id"], "parent_id": nid, "chunk_type": "neighbor_context",
+                "rerank_score": 0.0, "rrf_score": 0.0,
+            })
+            seen.add(nid)
+        return selected or children
