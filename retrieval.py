@@ -58,10 +58,7 @@ class BM25Index:
             return []
         scores = self._bm25.get_scores(tokens)
         top_i = np.argsort(scores)[::-1][:top_k]
-        return [
-            {**self._chunks[i], "bm25_score": float(scores[i])}
-            for i in top_i if scores[i] > 0
-        ]
+        return [{**self._chunks[i], "bm25_score": float(scores[i])} for i in top_i if scores[i] > 0]
 
 
 class CrossEncoderReranker:
@@ -91,7 +88,6 @@ class HybridRetriever:
         self.db: Optional[Database] = None
 
     def attach_database(self, db: Database) -> None:
-        """Attach SQLite so retrieval can expand children into parents."""
         self.db = db
 
     def _rrf_score(self, rank: int) -> float:
@@ -106,7 +102,6 @@ class HybridRetriever:
         except Exception as exc:
             log.error("[Dense] ChromaDB error: %s", exc)
             return []
-
         chunks = []
         ids = results.get("ids", [[]])[0]
         docs = results.get("documents", [[]])[0]
@@ -115,15 +110,11 @@ class HybridRetriever:
         for cid, text, meta, dist in zip(ids, docs, metas, dists):
             meta = meta or {}
             chunks.append({
-                "chroma_id": cid,
-                "text": text or "",
-                "doc_id": meta.get("doc_id", ""),
-                "parent_id": meta.get("parent_id", ""),
-                "filename": meta.get("source", ""),
+                "chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
+                "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
                 "page_number": meta.get("page", 0),
                 "end_page": meta.get("end_page", meta.get("page", 0)),
-                "section_path": meta.get("section_path", ""),
-                "chunk_type": "child",
+                "section_path": meta.get("section_path", ""), "chunk_type": "child",
                 "dense_score": round(1 - float(dist), 4),
             })
         return chunks
@@ -146,8 +137,7 @@ class HybridRetriever:
                 except Exception:
                     text, meta = chunk.get("text", chunk.get("text_preview", "")), {}
                 rrf[cid] = {
-                    **chunk,
-                    "text": text,
+                    **chunk, "text": text,
                     "filename": meta.get("source", chunk.get("filename", "")),
                     "page_number": meta.get("page", chunk.get("page_number", 0)),
                     "parent_id": meta.get("parent_id", chunk.get("parent_id", "")),
@@ -166,15 +156,11 @@ class HybridRetriever:
         return reranked, bm25_ids, dense_ids
 
     def retrieve_candidates(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
-        """Compatibility entry point used by pipeline.py; returns reranked children."""
-        return self.retrieve(query, metadata_filter)
+        """Return reranked children expanded to coherent parent context units."""
+        children, bm25_ids, dense_ids = self.retrieve(query, metadata_filter)
+        return self.expand_to_context(children), bm25_ids, dense_ids
 
     def expand_to_context(self, children: list[dict]) -> list[dict]:
-        """Replace/augment winning children with their parent and nearby children.
-
-        Parent text is preferred because it preserves the semantic section. A small
-        number of adjacent children is included when available to bridge boundaries.
-        """
         if not children or self.db is None:
             return children
         parent_ids = [c.get("parent_id") for c in children if c.get("parent_id")]
@@ -189,14 +175,13 @@ class HybridRetriever:
                 parent_ids,
             ).fetchall()
             parent_map = {r["id"]: dict(r) for r in parents}
-
             expanded: list[dict] = []
             seen = set()
             for child in children:
                 pid = child.get("parent_id")
                 parent = parent_map.get(pid)
                 if parent and pid not in seen:
-                    item = {
+                    expanded.append({
                         **child,
                         "text": parent["text"],
                         "chunk_type": "parent_context",
@@ -204,8 +189,7 @@ class HybridRetriever:
                         "page_number": parent["page_number"],
                         "end_page": parent["end_page"],
                         "section_path": parent["section_path"],
-                    }
-                    expanded.append(item)
+                    })
                     seen.add(pid)
                 elif not parent:
                     expanded.append(child)
