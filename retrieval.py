@@ -1,8 +1,9 @@
 """
 retrieval.py — Hybrid child retrieval: BM25 + Chroma dense + RRF + reranking.
 
-Retrieval operates on small child chunks. After reranking, winners expand to
-parent context units and nearby parent sections under a strict context budget.
+Retrieval operates on small child chunks. RRF produces retrieval candidates,
+then the pipeline performs one cross-encoder rerank after PDF and web
+candidates are merged. Reranked PDF children can then expand to parent context.
 """
 import logging
 import re
@@ -53,7 +54,9 @@ class BM25Index:
             self._bm25 = None
             log.info("[BM25] No child chunks — index empty")
             return
-        self._bm25 = BM25Okapi([_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks])
+        self._bm25 = BM25Okapi(
+            [_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks]
+        )
         log.info("[BM25] Index rebuilt: %d child chunks", len(self._chunks))
 
     def search(self, query: str, top_k: int) -> list[dict]:
@@ -64,7 +67,10 @@ class BM25Index:
             return []
         scores = self._bm25.get_scores(tokens)
         top_i = np.argsort(scores)[::-1][:top_k]
-        return [{**self._chunks[i], "bm25_score": float(scores[i])} for i in top_i if scores[i] > 0]
+        return [
+            {**self._chunks[i], "bm25_score": float(scores[i])}
+            for i in top_i if scores[i] > 0
+        ]
 
 
 class CrossEncoderReranker:
@@ -76,7 +82,10 @@ class CrossEncoderReranker:
     def rerank(self, query: str, chunks: list[dict], top_k: int, min_score: float) -> list[dict]:
         if not chunks:
             return []
-        scores = self._model.predict([(query, c.get("text", c.get("text_preview", ""))) for c in chunks]).tolist()
+        raw_scores = self._model.predict([
+            (query, c.get("text", c.get("text_preview", ""))) for c in chunks
+        ])
+        scores = np.asarray(raw_scores).reshape(-1).tolist()
         for chunk, score in zip(chunks, scores):
             chunk["rerank_score"] = round(float(score), 4)
         ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
@@ -90,58 +99,38 @@ class HybridRetriever:
         self.bm25 = bm25_index
         self.reranker = reranker
         self.cfg = cfg
-        # BM25 already owns the canonical SQLite connection target.
         self.db: Database = bm25_index.db
 
     def _rrf_score(self, rank: int) -> float:
         return 1.0 / (self.cfg.rrf_k + rank + 1)
 
-    # def _dense_search(self, query: str, top_k: int, metadata_filter: Optional[dict]) -> list[dict]:
-    #     kwargs = {"query_texts": [query], "n_results": top_k}
-    #     if metadata_filter:
-    #         kwargs["where"] = metadata_filter
-    #     try:
-    #         results = self.vs._collection.query(**kwargs)
-    #     except Exception as exc:
-    #         log.error("[Dense] ChromaDB error: %s", exc)
-    #         return []
-    #     chunks = []
-    #     for cid, text, meta, dist in zip(
-    #         results.get("ids", [[]])[0], results.get("documents", [[]])[0],
-    #         results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]
-    #     ):
-    #         meta = meta or {}
-    #         chunks.append({
-    #             "chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
-    #             "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
-    #             "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
-    #             "section_path": meta.get("section_path", ""), "chunk_type": "child",
-    #             "dense_score": round(1 - float(dist), 4),
-    #         })
-    #     return chunks
-
-    def _dense_search(
-        self,
-        query: str,
-        top_k: int,
-        metadata_filter: Optional[dict],
-    ) -> list[dict]:
-
-        query_embedding = self.vs._embedding_function.embed_query(query)
-
-        kwargs = {
-            "query_embeddings": [query_embedding],
-            "n_results": top_k,
-        }
-
+    def _dense_search(self, query: str, top_k: int, metadata_filter: Optional[dict]) -> list[dict]:
+        kwargs = {"query_texts": [query], "n_results": top_k}
         if metadata_filter:
             kwargs["where"] = metadata_filter
-
         try:
+            query_embedding = self._query_embedding(query)
+            kwargs = {"query_embeddings": [query_embedding], "n_results": top_k}
+            if metadata_filter:
+                kwargs["where"] = metadata_filter
             results = self.vs._collection.query(**kwargs)
         except Exception as exc:
             log.error("[Dense] ChromaDB error: %s", exc)
             return []
+        chunks = []
+        for cid, text, meta, dist in zip(
+            results.get("ids", [[]])[0], results.get("documents", [[]])[0],
+            results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]
+        ):
+            meta = meta or {}
+            chunks.append({
+                "chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
+                "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
+                "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
+                "section_path": meta.get("section_path", ""), "chunk_type": "child",
+                "dense_score": round(1 - float(dist), 4),
+            })
+        return chunks
 
     def _fuse(self, dense_chunks: list[dict], bm25_chunks: list[dict]) -> tuple[list[dict], set, set]:
         dense_ids = {c["chroma_id"] for c in dense_chunks}
@@ -161,8 +150,9 @@ class HybridRetriever:
                 except Exception:
                     text, meta = chunk.get("text", chunk.get("text_preview", "")), {}
                 rrf[cid] = {
-                    **chunk, "text": text,
-                    "filename": meta.get("source", chunk.get("filename", "")),
+                    **chunk,
+                    "text": text,
+                    "filename": meta.get("source", meta.get("filename", chunk.get("filename", ""))),
                     "page_number": meta.get("page", chunk.get("page_number", 0)),
                     "parent_id": meta.get("parent_id", chunk.get("parent_id", "")),
                     "section_path": meta.get("section_path", chunk.get("section_path", "")),
@@ -173,18 +163,22 @@ class HybridRetriever:
         return candidates[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)], bm25_ids, dense_ids
 
     def retrieve(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
+        """Return RRF-fused child candidates; reranking is performed once by the pipeline."""
         dense = self._dense_search(query, self.cfg.top_k_dense, metadata_filter)
         bm25 = self.bm25.search(query, self.cfg.top_k_sparse)
         candidates, bm25_ids, dense_ids = self._fuse(dense, bm25)
-        reranked = self.reranker.rerank(query, candidates, self.cfg.top_k_rerank, self.cfg.min_rerank_score)
-        return reranked, bm25_ids, dense_ids
+        log.info(
+            "[Hybrid] candidates=%d | BM25=%d | dense=%d | overlap=%d",
+            len(candidates), len(bm25_ids), len(dense_ids), len(bm25_ids & dense_ids),
+        )
+        return candidates, bm25_ids, dense_ids
 
     def retrieve_candidates(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
-        children, bm25_ids, dense_ids = self.retrieve(query, metadata_filter)
-        return self.expand_to_context(children), bm25_ids, dense_ids
+        """Compatibility wrapper used by the pipeline; returns child candidates only."""
+        return self.retrieve(query, metadata_filter)
 
     def expand_to_context(self, children: list[dict]) -> list[dict]:
-        """Expand children to parents + adjacent parent sections within budget."""
+        """Expand reranked children to parents + adjacent parent sections within budget."""
         if not children:
             return []
         parent_ids = list(dict.fromkeys(c.get("parent_id") for c in children if c.get("parent_id")))
@@ -197,8 +191,6 @@ class HybridRetriever:
                     FROM chunks WHERE chunk_type='parent' AND id IN ({placeholders})""", parent_ids
             ).fetchall()
             parent_map = {r["id"]: dict(r) for r in rows}
-
-            # Preserve document-local ordering so neighbors are meaningful.
             neighbors: list[dict] = []
             for parent in rows:
                 for delta in range(1, self.cfg.context_neighbor_count + 1):
@@ -213,37 +205,53 @@ class HybridRetriever:
 
         selected: list[dict] = []
         seen: set[str] = set()
+        used = 0
         budget = self.cfg.context_budget_tokens
         for child in children:
             pid = child.get("parent_id")
             parent = parent_map.get(pid)
             if not parent or pid in seen:
                 continue
-            tokens = _token_count(parent["text"])
-            if selected and sum(_token_count(x["text"]) for x in selected) + tokens > budget:
+            text = parent["text"]
+            tokens = _token_count(text)
+            if selected and used + tokens > budget:
                 continue
             if not selected and tokens > budget:
-                parent["text"] = " ".join(parent["text"].split()[:budget])
+                words = text.split()
+                text = " ".join(words[:budget])
+                tokens = _token_count(text)
             selected.append({
-                **child, "text": parent["text"], "chunk_type": "parent_context",
-                "parent_id": pid, "page_number": parent["page_number"],
-                "end_page": parent["end_page"], "section_path": parent["section_path"],
+                **child,
+                "text": text,
+                "chunk_type": "parent_context",
+                "parent_id": pid,
+                "page_number": parent["page_number"],
+                "end_page": parent["end_page"],
+                "section_path": parent["section_path"],
             })
+            used += tokens
             seen.add(pid)
 
-        # Neighbors are lower-priority context and never displace retrieved parents.
         for neighbor in neighbors:
             nid = neighbor["id"]
             if nid in seen:
                 continue
-            used = sum(_token_count(x["text"]) for x in selected)
-            if used + _token_count(neighbor["text"]) > budget:
+            text = neighbor["text"]
+            tokens = _token_count(text)
+            if used + tokens > budget:
                 continue
             selected.append({
-                "text": neighbor["text"], "filename": "", "page_number": neighbor["page_number"],
-                "end_page": neighbor["end_page"], "section_path": neighbor["section_path"],
-                "doc_id": neighbor["doc_id"], "parent_id": nid, "chunk_type": "neighbor_context",
-                "rerank_score": 0.0, "rrf_score": 0.0,
+                "text": text,
+                "filename": neighbor.get("doc_id", ""),
+                "page_number": neighbor["page_number"],
+                "end_page": neighbor["end_page"],
+                "section_path": neighbor["section_path"],
+                "doc_id": neighbor["doc_id"],
+                "parent_id": nid,
+                "chunk_type": "neighbor_context",
+                "rerank_score": 0.0,
+                "rrf_score": 0.0,
             })
+            used += tokens
             seen.add(nid)
         return selected or children
