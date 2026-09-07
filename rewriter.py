@@ -4,8 +4,8 @@ rewriter.py — Trainable query rewrite pipeline (Rewrite → Retrieve → Read)
 How it works:
   1. rewrite(query) — LLM expands the raw query into a richer retrieval query.
      Before calling the LLM it pulls up to MAX_FEW_SHOT positive examples from
-     the rewrite history table (rows where was_helpful = 1). These examples
-     are injected as few-shot demonstrations so the rewriter improves over time
+     the rewrite history table (rows where was_helpful = 1). These examples are
+     injected as few-shot demonstrations so the rewriter improves over time
      as feedback accumulates.
 
   2. record_feedback(rewrite_id, helpful) — called after the pipeline delivers
@@ -21,6 +21,7 @@ accumulated feedback — no gradient updates, but the few-shot pool grows
 and improves, which is the practical lightweight approach for local LLMs.
 """
 import logging
+import re
 import time
 from typing import Optional
 
@@ -38,33 +39,37 @@ MAX_FEW_SHOT = 4   # max positive examples injected into the rewrite prompt
 
 # ── Prompt templates ──────────────────────────────────────────────────────────
 
-# Used when no few-shot examples are available yet (cold start)
 _COLD_PROMPT = ChatPromptTemplate.from_template("""
 You are a search query optimizer for a RAG system.
-Rewrite the user's query to maximise retrieval recall.
+Rewrite the user's query to maximise retrieval recall while preserving the
+user's exact intent.
 
 Rules:
-- Expand acronyms and add synonyms.
-- Make implicit concepts explicit.
+- If the query is already clear, make only small retrieval-oriented expansions.
+- Do not change the question being asked, its subject, or its requested scope.
+- Expand acronyms and add closely related synonyms only when useful.
 - Keep the rewritten query under 80 words.
+- Preserve important terminology from the original query.
 - Return ONLY the rewritten query — no preamble, no explanation.
 
 Original query: {query}
 Rewritten query:""")
 
-# Used once positive examples exist in the rewrite history
 _FEW_SHOT_PROMPT = ChatPromptTemplate.from_template("""
 You are a search query optimizer for a RAG system.
-Rewrite the user's query to maximise retrieval recall.
+Rewrite the user's query to maximise retrieval recall while preserving the
+user's exact intent.
 
 Here are examples of good rewrites that led to useful answers:
 {examples}
 
 Rules:
-- Follow the style of the examples above.
-- Expand acronyms and add synonyms.
-- Make implicit concepts explicit.
+- Follow the style of the examples above without copying their subject matter.
+- If the query is already clear, make only small retrieval-oriented expansions.
+- Do not change the question being asked, its subject, or its requested scope.
+- Expand acronyms and add closely related synonyms only when useful.
 - Keep the rewritten query under 80 words.
+- Preserve important terminology from the original query.
 - Return ONLY the rewritten query — no preamble, no explanation.
 
 Original query: {query}
@@ -77,33 +82,19 @@ class QueryRewriter:
 
     Usage:
         rewriter = QueryRewriter(db, cfg, llm)
-
         rewrite_id, rewritten = rewriter.rewrite("what did perry do in japan")
-        # → (42, "What were the political and economic consequences of
-        #          Commodore Matthew Perry's 1853 expedition to Edo Bay, Japan,
-        #          and how did it accelerate the Meiji-era westernization?")
-
-        # After the answer is delivered and user rates it:
         rewriter.record_feedback(rewrite_id, helpful=True)
         rewriter.record_answer_score(rewrite_id, score=0.91)
     """
 
     def __init__(self, db: Database, cfg: RAGConfig, llm: ChatOllama) -> None:
-        self.db  = db
+        self.db = db
         self.cfg = cfg
-        self._cold_chain = _COLD_PROMPT    | llm | StrOutputParser()
-        self._few_chain  = _FEW_SHOT_PROMPT | llm | StrOutputParser()
-
-    # ── Public API ────────────────────────────────────────────────────────────
+        self._cold_chain = _COLD_PROMPT | llm | StrOutputParser()
+        self._few_chain = _FEW_SHOT_PROMPT | llm | StrOutputParser()
 
     def rewrite(self, query: str) -> tuple[int, str]:
-        """
-        Rewrite `query` for better retrieval.
-
-        Returns:
-            (rewrite_id, rewritten_query)
-            rewrite_id is the SQLite row id — pass it back to record_feedback().
-        """
+        """Rewrite `query` for better retrieval while preserving intent."""
         examples = self._fetch_positive_examples()
 
         if examples:
@@ -113,34 +104,55 @@ class QueryRewriter:
                 for ex in examples
             )
             rewritten = self._few_chain.invoke({
-                "query":    query,
+                "query": query,
                 "examples": example_block,
             }).strip()
-            log.info(f"[Rewriter] Few-shot ({len(examples)} examples) rewrite done")
+            log.info("[Rewriter] Few-shot (%d examples) rewrite done", len(examples))
         else:
             rewritten = self._cold_chain.invoke({"query": query}).strip()
             log.info("[Rewriter] Cold-start rewrite done")
 
-        # Sanitise: if the model returns something unusable, fall back to original
-        if not rewritten or len(rewritten) < 5:
-            log.warning("[Rewriter] LLM returned empty rewrite — using original")
-            rewritten = query
-
+        rewritten = self._sanitize(query, rewritten)
         rewrite_id = self._store(query, rewritten)
-        log.info(f"[Rewriter] '{query[:50]}' →\n           '{rewritten[:80]}'")
+        log.info("[Rewriter] '%s' →\n           '%s'", query[:50], rewritten[:80])
         return rewrite_id, rewritten
 
+    @staticmethod
+    def _sanitize(original: str, rewritten: str) -> str:
+        """Keep LLM output usable as a retrieval query without changing its meaning."""
+        candidate = (rewritten or "").strip()
+        if len(candidate) < 5:
+            log.warning("[Rewriter] LLM returned unusable rewrite — using original")
+            return original.strip()
+
+        # Remove common LLM wrappers accidentally emitted around the query.
+        candidate = re.sub(r"^(?:rewritten query|query)\s*:\s*", "", candidate, flags=re.I).strip()
+        candidate = candidate.strip("`\"'")
+
+        # Repair a dangling opening parenthesis/bracket from truncated model output.
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack: list[str] = []
+        for char in candidate:
+            if char in pairs:
+                stack.append(pairs[char])
+            elif char in pairs.values() and stack and char == stack[-1]:
+                stack.pop()
+        if stack:
+            candidate += "".join(reversed(stack))
+
+        # The rewriter should never return an obviously incomplete fragment.
+        if candidate.endswith(("(", "[", "{", ":", "-")):
+            return original.strip()
+        return candidate
+
     def record_feedback(self, rewrite_id: int, helpful: bool) -> None:
-        """
-        Mark a rewrite as helpful (True) or not (False).
-        Helpful rewrites join the few-shot pool for future queries.
-        """
+        """Mark a rewrite as helpful (True) or not (False)."""
         with self.db.connect() as conn:
             conn.execute(
                 "UPDATE query_rewrites SET was_helpful = ? WHERE id = ?",
                 (1 if helpful else 0, rewrite_id)
             )
-        log.info(f"[Rewriter] Feedback recorded: id={rewrite_id} helpful={helpful}")
+        log.info("[Rewriter] Feedback recorded: id=%d helpful=%s", rewrite_id, helpful)
 
     def record_answer_score(self, rewrite_id: int, score: float) -> None:
         """Store the faithfulness score (0–1) alongside the rewrite row."""
@@ -162,27 +174,22 @@ class QueryRewriter:
         with self.db.connect() as conn:
             row = conn.execute("""
                 SELECT
-                    COUNT(*)                          AS total,
+                    COUNT(*) AS total,
                     SUM(CASE WHEN was_helpful=1 THEN 1 ELSE 0 END) AS positive,
                     SUM(CASE WHEN was_helpful=0 THEN 1 ELSE 0 END) AS negative,
-                    AVG(answer_score)                 AS mean_score
+                    AVG(answer_score) AS mean_score
                 FROM query_rewrites
             """).fetchone()
         return {
-            "total_rewrites":   row["total"],
-            "positive":         row["positive"],
-            "negative":         row["negative"],
-            "few_shot_pool":    row["positive"],
+            "total_rewrites": row["total"],
+            "positive": row["positive"],
+            "negative": row["negative"],
+            "few_shot_pool": row["positive"],
             "mean_answer_score": round(row["mean_score"], 3) if row["mean_score"] else None,
         }
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
     def _fetch_positive_examples(self) -> list[dict]:
-        """
-        Retrieve the top MAX_FEW_SHOT positive rewrites, ranked by answer_score
-        descending (best-performing first). Falls back to recency if no scores set.
-        """
+        """Retrieve the top MAX_FEW_SHOT positive rewrites."""
         with self.db.connect() as conn:
             rows = conn.execute(
                 """SELECT original_query, rewritten_query, answer_score
