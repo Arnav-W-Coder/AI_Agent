@@ -2,8 +2,7 @@
 ingestion.py — Async, batched PDF ingestion with hierarchical chunking.
 
 PDFs are split into structural sections, semantic blocks, bounded parents, and
-small retrieval children. Only children are embedded/indexed; parents remain in
-SQLite for context expansion after retrieval.
+small retrieval children. Only children are embedded/indexed; parents remain in SQLite for context expansion after retrieval.
 """
 import asyncio
 import hashlib
@@ -64,16 +63,16 @@ class AsyncIngestionPipeline:
                 f"Embedding dimension mismatch inside OllamaEmbeddings: documents={doc_dim}, query={query_dim}"
             )
 
-        # If the persistent collection already contains vectors, verify its
-        # stored dimensionality before any new writes occur.
         try:
             peek = self.vectorstore._collection.peek(limit=1)
-            vectors = peek.get("embeddings") or []
-            if vectors and len(vectors[0]) != doc_dim:
-                raise RuntimeError(
-                    f"Chroma collection dimension mismatch: collection={len(vectors[0])}, model={doc_dim}. "
-                    "Reset/rebuild the PDF Chroma collection before ingesting."
-                )
+            vectors = peek.get("embeddings")
+            if vectors is not None and len(vectors) > 0:
+                stored_dim = len(vectors[0])
+                if stored_dim != doc_dim:
+                    raise RuntimeError(
+                        f"Chroma collection dimension mismatch: collection={stored_dim}, model={doc_dim}. "
+                        "Reset/rebuild the PDF Chroma collection before ingesting."
+                    )
         except RuntimeError:
             raise
         except Exception as exc:
