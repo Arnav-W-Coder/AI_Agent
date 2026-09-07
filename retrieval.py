@@ -96,29 +96,52 @@ class HybridRetriever:
     def _rrf_score(self, rank: int) -> float:
         return 1.0 / (self.cfg.rrf_k + rank + 1)
 
-    def _dense_search(self, query: str, top_k: int, metadata_filter: Optional[dict]) -> list[dict]:
-        kwargs = {"query_texts": [query], "n_results": top_k}
+    # def _dense_search(self, query: str, top_k: int, metadata_filter: Optional[dict]) -> list[dict]:
+    #     kwargs = {"query_texts": [query], "n_results": top_k}
+    #     if metadata_filter:
+    #         kwargs["where"] = metadata_filter
+    #     try:
+    #         results = self.vs._collection.query(**kwargs)
+    #     except Exception as exc:
+    #         log.error("[Dense] ChromaDB error: %s", exc)
+    #         return []
+    #     chunks = []
+    #     for cid, text, meta, dist in zip(
+    #         results.get("ids", [[]])[0], results.get("documents", [[]])[0],
+    #         results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]
+    #     ):
+    #         meta = meta or {}
+    #         chunks.append({
+    #             "chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
+    #             "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
+    #             "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
+    #             "section_path": meta.get("section_path", ""), "chunk_type": "child",
+    #             "dense_score": round(1 - float(dist), 4),
+    #         })
+    #     return chunks
+
+    def _dense_search(
+        self,
+        query: str,
+        top_k: int,
+        metadata_filter: Optional[dict],
+    ) -> list[dict]:
+
+        query_embedding = self.vs._embedding_function.embed_query(query)
+
+        kwargs = {
+            "query_embeddings": [query_embedding],
+            "n_results": top_k,
+        }
+
         if metadata_filter:
             kwargs["where"] = metadata_filter
+
         try:
             results = self.vs._collection.query(**kwargs)
         except Exception as exc:
             log.error("[Dense] ChromaDB error: %s", exc)
             return []
-        chunks = []
-        for cid, text, meta, dist in zip(
-            results.get("ids", [[]])[0], results.get("documents", [[]])[0],
-            results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]
-        ):
-            meta = meta or {}
-            chunks.append({
-                "chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
-                "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
-                "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
-                "section_path": meta.get("section_path", ""), "chunk_type": "child",
-                "dense_score": round(1 - float(dist), 4),
-            })
-        return chunks
 
     def _fuse(self, dense_chunks: list[dict], bm25_chunks: list[dict]) -> tuple[list[dict], set, set]:
         dense_ids = {c["chroma_id"] for c in dense_chunks}

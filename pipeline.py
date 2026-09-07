@@ -248,9 +248,11 @@ class ProductionRAGPipeline:
             }
 
         # ── 3. Rewrite query ──────────────────────────────────────────────────
-        rewrite_id, rewritten = self.rewriter.rewrite(question)
-        trace.t_rewrite       = time.time()
-        trace.rewritten_query = rewritten
+        # rewrite_id, rewritten = self.rewriter.rewrite(question)
+        # trace.t_rewrite       = time.time()
+        # trace.rewritten_query = rewritten
+
+        rewritten = question  # TODO: Uncomment the rewrite block above to enable query rewriting
 
         # ── 4. Retrieval cache check ──────────────────────────────────────────
         cached_chunks = self.cache.get_retrieval(rewritten)
@@ -385,11 +387,11 @@ class ProductionRAGPipeline:
         self.metrics.record(trace)
 
         # ── 13. Auto-label rewrite from faithfulness score ────────────────────
-        self.rewriter.record_answer_score(rewrite_id, faith_score)
-        if faith_score >= self.cfg.rewriter_helpful_min_score:
-            self.rewriter.record_feedback(rewrite_id, helpful=True)
-        elif faith_score < self.cfg.rewriter_unhelpful_max_score:
-            self.rewriter.record_feedback(rewrite_id, helpful=False)
+        # self.rewriter.record_answer_score(rewrite_id, faith_score)
+        # if faith_score >= self.cfg.rewriter_helpful_min_score:
+        #     self.rewriter.record_feedback(rewrite_id, helpful=True)
+        # elif faith_score < self.cfg.rewriter_unhelpful_max_score:
+        #     self.rewriter.record_feedback(rewrite_id, helpful=False)
         # Scores between the two thresholds get no auto-label — awaits user rating
 
         # ── 14. Drift check every drift_window queries ────────────────────────
@@ -403,7 +405,7 @@ class ProductionRAGPipeline:
             "answer":          answer,
             "sources":         sources,
             "query_id":        trace.query_id,
-            "rewrite_id":      rewrite_id,
+            #"rewrite_id":      rewrite_id,
             "rewritten_query": rewritten,
             "from_cache":      False,
             "drift_alert":     drift_alert,
