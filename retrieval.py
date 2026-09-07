@@ -105,11 +105,8 @@ class HybridRetriever:
         return 1.0 / (self.cfg.rrf_k + rank + 1)
 
     def _dense_search(self, query: str, top_k: int, metadata_filter: Optional[dict]) -> list[dict]:
-        kwargs = {"query_texts": [query], "n_results": top_k}
-        if metadata_filter:
-            kwargs["where"] = metadata_filter
         try:
-            query_embedding = self._query_embedding(query)
+            query_embedding = self.vs._embedding_function.embed_documents([query])[0]
             kwargs = {"query_embeddings": [query_embedding], "n_results": top_k}
             if metadata_filter:
                 kwargs["where"] = metadata_filter
