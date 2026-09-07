@@ -45,12 +45,14 @@ class WebChunkStore:
         dim = len(vector)
         try:
             peek = self._chroma._collection.peek(limit=1)
-            vectors = peek.get("embeddings") or []
-            if vectors and len(vectors[0]) != dim:
-                raise RuntimeError(
-                    f"Web Chroma collection dimension mismatch: collection={len(vectors[0])}, model={dim}. "
-                    "Reset/rebuild chroma_web before using the persistent web cache."
-                )
+            vectors = peek.get("embeddings")
+            if vectors is not None and len(vectors) > 0:
+                stored_dim = len(vectors[0])
+                if stored_dim != dim:
+                    raise RuntimeError(
+                        f"Web Chroma collection dimension mismatch: collection={stored_dim}, model={dim}. "
+                        "Reset/rebuild chroma_web before using the persistent web cache."
+                    )
         except RuntimeError:
             raise
         except Exception as exc:
