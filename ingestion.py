@@ -48,6 +48,36 @@ class AsyncIngestionPipeline:
         self.vectorstore = vectorstore
         self.embeddings = embeddings
         self.chunker = HierarchicalChunker(cfg, self.embeddings.embed_documents)
+        self._validate_embedding_contract()
+
+    def _validate_embedding_contract(self) -> None:
+        """Fail early if the embedding model cannot satisfy Chroma's dimension contract."""
+        probe = self.embeddings.embed_documents(["__rag_embedding_dimension_probe__"])
+        if not probe or not probe[0]:
+            raise RuntimeError("Embedding model returned an empty vector during setup")
+        query_probe = self.embeddings.embed_documents(["__rag_query_dimension_probe__"])[0]
+        doc_dim = len(probe[0])
+        query_dim = len(query_probe)
+        log.info("[Embeddings] document/query dimension=%d/%d", doc_dim, query_dim)
+        if doc_dim != query_dim:
+            raise RuntimeError(
+                f"Embedding dimension mismatch inside OllamaEmbeddings: documents={doc_dim}, query={query_dim}"
+            )
+
+        # If the persistent collection already contains vectors, verify its
+        # stored dimensionality before any new writes occur.
+        try:
+            peek = self.vectorstore._collection.peek(limit=1)
+            vectors = peek.get("embeddings") or []
+            if vectors and len(vectors[0]) != doc_dim:
+                raise RuntimeError(
+                    f"Chroma collection dimension mismatch: collection={len(vectors[0])}, model={doc_dim}. "
+                    "Reset/rebuild the PDF Chroma collection before ingesting."
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            log.warning("[Embeddings] Could not inspect existing Chroma dimension: %s", exc)
 
     def _already_ingested(self, filepath: Path, file_hash: str) -> bool:
         with self.db.connect() as conn:
@@ -72,7 +102,9 @@ class AsyncIngestionPipeline:
             ).fetchall()]
         if rows:
             try:
-                self.vectorstore._collection.delete(ids=[r["chroma_id"] for r in rows])
+                ids = [r["chroma_id"] for r in rows if r["chroma_id"]]
+                if ids:
+                    self.vectorstore._collection.delete(ids=ids)
             except Exception as exc:
                 log.warning("[Ingestion] Could not remove old Chroma vectors: %s", exc)
         if doc_ids:
@@ -84,14 +116,23 @@ class AsyncIngestionPipeline:
         loop = asyncio.get_event_loop()
         texts = [c.text for c in chunks]
         vectors = await loop.run_in_executor(executor, self.embeddings.embed_documents, texts)
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"Embedding batch returned {len(vectors)} vectors for {len(texts)} chunks"
+            )
+        expected_dim = len(vectors[0]) if vectors else 0
+        if any(len(v) != expected_dim for v in vectors):
+            raise RuntimeError("Embedding batch contains inconsistent vector dimensions")
         chroma_ids = [str(uuid.uuid4()) for _ in chunks]
         metadatas = []
         for chunk in chunks:
+            source = chunk.metadata.get("source", "")
             metadatas.append({
                 "doc_id": doc_id,
                 "parent_id": chunk.parent_id or "",
                 "chunk_type": "child",
-                "source": chunk.metadata.get("source", ""),
+                "source": source,
+                "filename": Path(source).name if source else "",
                 "page": chunk.start_page,
                 "end_page": chunk.end_page,
                 "section_path": chunk.section_path,
@@ -100,7 +141,7 @@ class AsyncIngestionPipeline:
             ids=chroma_ids, documents=texts, embeddings=vectors, metadatas=metadatas
         )
         with self.db.connect() as conn:
-            for i, (chroma_id, chunk) in enumerate(zip(chroma_ids, chunks)):
+            for chunk, chroma_id in zip(chunks, chroma_ids):
                 conn.execute(
                     """INSERT INTO chunks
                        (id, doc_id, chroma_id, chunk_index, page_number, text_preview,
