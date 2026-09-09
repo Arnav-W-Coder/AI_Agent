@@ -1,6 +1,4 @@
-"""
-chunking.py — structure-aware, semantic-recursive hierarchical chunking.
-"""
+"""chunking.py — structure-aware, semantic-recursive hierarchical chunking."""
 from __future__ import annotations
 import logging
 import re
@@ -10,6 +8,8 @@ from typing import Callable, Sequence
 import numpy as np
 import tiktoken
 from langchain_core.documents import Document
+
+from checkpoints import checkpoint
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +133,9 @@ class HierarchicalChunker:
                 blocks.append("\n\n".join(current)); current = []
         if current:
             blocks.append("\n\n".join(current))
+        checkpoint("chunking.semantic_blocks", blocks, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+                   paragraphs=len(paragraphs), blocks=len(blocks), threshold=threshold)
         return blocks
 
     def _recursive_cap(self, text: str, max_tokens: int) -> list[str]:
@@ -181,14 +184,19 @@ class HierarchicalChunker:
         return out
 
     def chunk(self, pages: Sequence[Document], doc_id: str) -> tuple[list[ChunkRecord], list[ChunkRecord]]:
+        checkpoint("chunking.input", pages, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+                   doc_id=doc_id, pages=len(pages))
+        sections = self._structure_sections(pages)
+        checkpoint("chunking.structure_sections", sections, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+                   section_count=len(sections))
         parents, children = [], []
         parent_index = child_index = 0
-        for section in self._structure_sections(pages):
+        for section in sections:
             for parent_text in self._make_parents(section):
                 parent_id = str(uuid.uuid4())
                 contextual = f"{section.path}\n\n{parent_text}" if section.path else parent_text
-                # Negative indices keep parent and child namespaces distinct while
-                # preserving adjacency for neighbor lookup in SQLite.
                 parents.append(ChunkRecord(parent_id, contextual, "parent", -(parent_index + 1), None,
                                             section.start_page, section.end_page, section.path, {"doc_id": doc_id}))
                 for child_text in self._make_children(contextual):
@@ -197,4 +205,8 @@ class HierarchicalChunker:
                                                 {"doc_id": doc_id, "parent_id": parent_id}))
                     child_index += 1
                 parent_index += 1
+        checkpoint("chunking.output", {"parents": parents, "children": children},
+                   enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items,
+                   parent_count=len(parents), child_count=len(children))
         return parents, children
