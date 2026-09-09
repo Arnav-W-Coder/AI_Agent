@@ -63,6 +63,13 @@ class RAGConfig:
     min_retrieval_score: float = 0.20
     latency_warn_ms:     int   = 6000
 
+    # ── Debug / data-flow checkpoints ─────────────────────────────────────────
+    # Checkpoints log shapes, keys, counts, scores, provenance, and tiny text
+    # previews without dumping full documents, prompts, or embeddings.
+    debug_checkpoints: bool = True
+    checkpoint_preview_chars: int = 160
+    checkpoint_sample_items: int = 3
+
     # ── Web scraping ──────────────────────────────────────────────────────────
     max_scrape_urls:   int = 5
     ddg_retries:       int = 3
