@@ -1,18 +1,4 @@
-"""
-pipeline.py — Wires every component into one production-grade system.
-
-Query flow:
-  1. Embed query → answer-cache lookup
-  2. Rewrite query
-  3. Retrieval-cache lookup
-  4. Hybrid PDF retrieval → BM25 + dense ANN → RRF
-  5. Web retrieval runs concurrently when configured (always-on remains supported)
-  6. Merge PDF + web candidates → ONE cross-encoder rerank
-  7. Expand winning PDF children to parent/neighbor context
-  8. Grounded LLM generation
-  9. Claim-level critic → optional surgical repair
-  10. Deterministic cleanup and cache/metrics storage
-"""
+"""pipeline.py — Production RAG orchestration."""
 import logging
 import re
 import time
@@ -26,39 +12,35 @@ import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-from config import RAGConfig
-from db import Database
 from cache import CacheLayer
-from metrics import MetricsRecorder, QueryTrace
+from config import RAGConfig
+from critic import CriticAndRepair
+from db import Database
 from ingestion import AsyncIngestionPipeline
+from metrics import MetricsRecorder, QueryTrace
 from retrieval import BM25Index, CrossEncoderReranker, HybridRetriever
 from rewriter import QueryRewriter
-from critic import CriticAndRepair
 from web_store import WebChunkStore
 
 log = logging.getLogger(__name__)
 
 _RAG_PROMPT = ChatPromptTemplate.from_template("""
 You are a precise research assistant. Answer the QUESTION using only the
-retrieved CONTEXT. The context may contain several sources, so synthesize the
-relevant evidence instead of copying a single sentence.
+retrieved CONTEXT. Synthesize relevant evidence across sources.
 
-Answer requirements:
+Requirements:
 - Directly answer the question first.
-- For questions asking for components, causes, steps, comparisons, or features,
-  cover each major item supported by the context and explain its role briefly.
-- Use short headings or numbered/bulleted lists when they improve clarity.
-- Explain relationships between components when the context supports them.
-- Prefer a complete, useful answer over a one-sentence summary.
+- Cover each major item supported by the context for component, cause, step,
+  comparison, or feature questions.
+- Use concise headings or lists when useful.
+- Explain relationships only when the context supports them.
 - Every factual claim must be supported by the context.
-- You may paraphrase and synthesize information that is explicitly supported by
-  multiple context chunks.
-- Do not invent facts, examples, citations, numbers, or terminology.
-- If the context genuinely does not contain enough information, say exactly:
+- Do not invent facts, examples, numbers, citations, or terminology.
+- If the context genuinely lacks enough information, say exactly:
   I don't have enough information to answer this confidently.
 
 CONTEXT:
@@ -70,19 +52,16 @@ ANSWER:
 """)
 
 _DOMAIN_SCORES: dict[str, int] = {
-    "wikipedia.org": 95, "britannica.com": 90,
-    "*.gov": 95, "*.edu": 90,
+    "wikipedia.org": 95, "britannica.com": 90, "*.gov": 95, "*.edu": 90,
     "arxiv.org": 92, "pubmed.ncbi.nlm.nih.gov": 95,
     "docs.python.org": 95, "developer.mozilla.org": 92,
     "aws.amazon.com": 85, "cloud.google.com": 85,
     "learn.microsoft.com": 85, "research.ibm.com": 88,
-    "openai.com": 82, "anthropic.com": 85,
-    "langchain.com": 80, "huggingface.co": 80,
-    "stackoverflow.com": 75, "github.com": 78,
+    "openai.com": 82, "anthropic.com": 85, "langchain.com": 80,
+    "huggingface.co": 80, "stackoverflow.com": 75, "github.com": 78,
     "towardsdatascience.com": 72, "medium.com": 65,
-    "pinterest.com": 0, "facebook.com": 0,
-    "twitter.com": 0, "x.com": 0, "tiktok.com": 0,
-    "grokipedia.com": 15,
+    "pinterest.com": 0, "facebook.com": 0, "twitter.com": 0,
+    "x.com": 0, "tiktok.com": 0, "grokipedia.com": 15,
 }
 
 
@@ -98,12 +77,11 @@ def _score_domain(url: str) -> int:
         suffix = ".".join(parts[i:])
         if suffix in _DOMAIN_SCORES:
             return _DOMAIN_SCORES[suffix]
-    tld_key = f"*.{parts[-1]}" if parts else ""
-    return _DOMAIN_SCORES.get(tld_key, 60)
+    return _DOMAIN_SCORES.get(f"*.{parts[-1]}", 60) if parts else 0
 
 
 class ProductionRAGPipeline:
-    """Deterministic production RAG pipeline."""
+    """Wire ingestion, retrieval, generation, evaluation, and monitoring."""
 
     def __init__(self, cfg: RAGConfig) -> None:
         self.cfg = cfg
@@ -111,15 +89,12 @@ class ProductionRAGPipeline:
         self.embeddings = OllamaEmbeddings(model=cfg.embed_model)
         self.llm = ChatOllama(model=cfg.llm_model, num_ctx=cfg.ctx_window)
         self.vectorstore = Chroma(
-            persist_directory=str(cfg.chroma_dir),
-            embedding_function=self.embeddings,
+            persist_directory=str(cfg.chroma_dir), embedding_function=self.embeddings
         )
-
         self.cache = CacheLayer(self.db, cfg)
         self.metrics = MetricsRecorder(self.db, cfg)
         self.rewriter = QueryRewriter(self.db, cfg, self.llm)
         self.critic = CriticAndRepair(self.llm, cfg=cfg)
-
         self.bm25: Optional[BM25Index] = None
         self.reranker: Optional[CrossEncoderReranker] = None
         self.retriever: Optional[HybridRetriever] = None
@@ -130,20 +105,17 @@ class ProductionRAGPipeline:
     async def setup(self) -> dict:
         log.info("=" * 60)
         log.info("[Pipeline] Starting setup...")
-
         ingestion = AsyncIngestionPipeline(
             self.db, self.cfg, self.vectorstore, self.embeddings
         )
         summaries = await ingestion.run()
         self.cache.invalidate_index_cache()
-
         self.bm25 = BM25Index(self.db)
         self.reranker = CrossEncoderReranker(self.cfg.rerank_model)
         self.retriever = HybridRetriever(
             self.vectorstore, self.bm25, self.reranker, self.cfg
         )
         self.web_store = WebChunkStore(self.db, self.cfg, self.embeddings)
-
         log.info("[Pipeline] Setup complete — ready to query.")
         log.info("=" * 60)
         return {"ingested_files": summaries}
@@ -166,12 +138,8 @@ class ProductionRAGPipeline:
             trace.t_end = time.time()
             self.metrics.record(trace)
             return {
-                "answer": answer,
-                "sources": sources,
-                "query_id": trace.query_id,
-                "rewrite_id": None,
-                "rewritten_query": question,
-                "from_cache": True,
+                "answer": answer, "sources": sources, "query_id": trace.query_id,
+                "rewrite_id": None, "rewritten_query": question, "from_cache": True,
                 "drift_alert": None,
                 "metrics": {"answer_cache_hit": True, "total_ms": trace.total_ms()},
             }
@@ -179,7 +147,6 @@ class ProductionRAGPipeline:
         rewrite_id, rewritten = self.rewriter.rewrite(question)
         trace.t_rewrite = time.time()
         trace.rewritten_query = rewritten
-
         cached_chunks = self.cache.get_retrieval(rewritten)
         bm25_ids: set = set()
         dense_ids: set = set()
@@ -198,12 +165,10 @@ class ProductionRAGPipeline:
                 )
                 web_fut = (
                     pool.submit(self._web_scrape_chunks, rewritten)
-                    if (use_web_fallback and self.cfg.always_scrape_web)
-                    else None
+                    if use_web_fallback and self.cfg.always_scrape_web else None
                 )
                 pdf_candidates, bm25_ids, dense_ids = pdf_fut.result()
                 web_chunks = web_fut.result() if web_fut else []
-
             trace.t_retrieval = time.time()
 
             if use_web_fallback and not self.cfg.always_scrape_web and not web_chunks:
@@ -220,7 +185,6 @@ class ProductionRAGPipeline:
                 if key not in seen_ids:
                     seen_ids.add(key)
                     all_candidates.append(candidate)
-
             for web_chunk in web_chunks[:self.cfg.web_top_k]:
                 key = f"web:{web_chunk.get('text', '')[:120]}"
                 if key not in seen_ids:
@@ -231,38 +195,30 @@ class ProductionRAGPipeline:
                 "[Query] Merged candidates: %d PDF + %d web = %d total",
                 len(pdf_candidates), len(web_chunks), len(all_candidates),
             )
-
-            # Exactly one cross-encoder pass, after all sources are merged.
+            # One and only one cross-encoder pass after PDF/web fusion.
             chunks = self.reranker.rerank(
-                rewritten,
-                all_candidates,
-                self.cfg.top_k_rerank,
-                self.cfg.min_rerank_score,
+                rewritten, all_candidates, self.cfg.top_k_rerank, self.cfg.min_rerank_score
             )
-
-            # Expand only after reranking so parent context does not distort
-            # candidate ranking and the cross-encoder scores remain child-level.
-            pdf_winners = [c for c in chunks if c.get("source_type") != "web" and c.get("parent_id")]
-            web_winners = [c for c in chunks if c.get("source_type") == "web" or not c.get("parent_id")]
+            pdf_winners = [
+                c for c in chunks
+                if c.get("source_type") != "web" and c.get("parent_id")
+            ]
+            web_winners = [
+                c for c in chunks
+                if c.get("source_type") == "web" or not c.get("parent_id")
+            ]
             expanded_pdf = self.retriever.expand_to_context(pdf_winners)
-
-            # Preserve reranked web chunks alongside expanded PDF context.
-            chunks = expanded_pdf + web_winners
             chunks = sorted(
-                chunks,
-                key=lambda c: c.get("rerank_score", 0.0),
-                reverse=True,
+                expanded_pdf + web_winners,
+                key=lambda c: c.get("rerank_score", 0.0), reverse=True,
             )[:self.cfg.top_k_rerank]
             trace.t_rerank = time.time()
             log.info(
                 "[Query] After rerank/context expansion: %d chunks | top score: %s",
-                len(chunks),
-                chunks[0].get("rerank_score") if chunks else "n/a",
+                len(chunks), chunks[0].get("rerank_score") if chunks else "n/a",
             )
-
             safe_chunks = [
-                {k: v for k, v in c.items()
-                 if isinstance(v, (str, int, float, bool, type(None)))}
+                {k: v for k, v in c.items() if isinstance(v, (str, int, float, bool, type(None)))}
                 for c in chunks
             ]
             self.cache.set_retrieval(rewritten, safe_chunks)
@@ -280,17 +236,25 @@ class ProductionRAGPipeline:
         answer = self._rag_chain.invoke({"context": context, "question": rewritten}).strip()
         trace.t_generation = time.time()
 
-        verdict, claims, faith_score = self.critic.check(context, answer)
-        log.info("[Query] Critic: %s | faithfulness=%.2f", verdict, faith_score)
+        # Question-aware evaluation: groundedness, completeness, and retrieval relevance.
+        verdict, issues, faith_score = self.critic.check(rewritten, context, answer)
+        critic_details = dict(self.critic.last_details)
+        log.info(
+            "[Query] Critic: %s | score=%.2f | grounded=%s | complete=%s | relevant=%s",
+            verdict, faith_score,
+            critic_details.get("groundedness", "?"),
+            critic_details.get("completeness", "?"),
+            critic_details.get("relevance", "?"),
+        )
+
+        # One bounded surgical repair. We deliberately do not run a second critic
+        # call merely to inflate the post-repair score or latency.
         if verdict == "HALLUCINATED":
-            answer = self.critic.repair(context, answer, claims)
-            # The pre-repair score remains the honest measured score. We do not
-            # make a second critic call just to increase latency.
+            answer = self.critic.repair(rewritten, context, answer, issues)
             log.info("[Query] Surgical repair applied")
 
         answer = self.critic.polish(answer)
         trace.answer_faithfulness = faith_score
-
         sources = [
             {
                 "filename": Path(c.get("filename", "web")).name,
@@ -300,29 +264,25 @@ class ProductionRAGPipeline:
             for c in chunks
         ]
         self.cache.set_answer(question, query_emb, answer, sources)
-
         trace.t_end = time.time()
         self.metrics.record(trace)
 
-        # ── 13. Auto-label rewrite from faithfulness score ────────────────────
         self.rewriter.record_answer_score(rewrite_id, faith_score)
         if faith_score >= self.cfg.rewriter_helpful_min_score:
             self.rewriter.record_feedback(rewrite_id, helpful=True)
         elif faith_score < self.cfg.rewriter_unhelpful_max_score:
             self.rewriter.record_feedback(rewrite_id, helpful=False)
-        # Scores between the two thresholds get no auto-label — awaits user rating
 
         self._query_count += 1
         drift_alert = None
         if self._query_count % self.cfg.drift_window == 0:
             drift_alert = self.metrics.check_drift()
-
         log.info("[Query] Done in %.0fms", trace.total_ms())
         return {
-            "answer":          answer,
-            "sources":         sources,
-            "query_id":        trace.query_id,
-            "rewrite_id":      rewrite_id,
+            "answer": answer,
+            "sources": sources,
+            "query_id": trace.query_id,
+            "rewrite_id": rewrite_id,
             "rewritten_query": rewritten,
             "from_cache": False,
             "drift_alert": drift_alert,
@@ -334,6 +294,9 @@ class ProductionRAGPipeline:
                 "top_rerank_score": trace.top_rerank_score,
                 "mean_rerank_score": trace.mean_rerank_score,
                 "faithfulness": faith_score,
+                "critic_groundedness": critic_details.get("groundedness", "UNKNOWN"),
+                "critic_completeness": critic_details.get("completeness", "UNKNOWN"),
+                "critic_relevance": critic_details.get("relevance", "UNKNOWN"),
                 "chunks_used": len(chunks),
                 "bm25_overlap": trace.bm25_overlap,
                 "retrieval_cached": trace.retrieval_cache_hit,
@@ -367,8 +330,6 @@ class ProductionRAGPipeline:
         log.info("[Pipeline] BM25 rebuild complete.")
 
     def _embed_query(self, text: str) -> np.ndarray:
-        # Use the same embedding endpoint as ingestion so cache vectors and
-        # Chroma document vectors always share one dimensionality.
         vector = self.embeddings.embed_documents([text])[0]
         return np.asarray(vector, dtype=np.float32)
 
@@ -404,8 +365,7 @@ class ProductionRAGPipeline:
         if raw:
             approved = sorted(
                 [r for r in raw if _score_domain(r.get("href", "")) >= self.cfg.min_domain_score],
-                key=lambda r: _score_domain(r.get("href", "")),
-                reverse=True,
+                key=lambda r: _score_domain(r.get("href", "")), reverse=True,
             )
             new_chunks = 0
             for result in approved:
@@ -418,7 +378,6 @@ class ProductionRAGPipeline:
             log.info("[WebScrape] %d new chunks added to persistent store", new_chunks)
         else:
             log.warning("[WebScrape] No DDG results — searching existing cache only.")
-
         return self.web_store.search(query, k=self.cfg.web_top_k)
 
     def _scrape_url(self, url: str, char_limit: int = 2500) -> str:
