@@ -19,6 +19,7 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
+from checkpoints import checkpoint
 from config import RAGConfig
 from db import Database
 from chunking import HierarchicalChunker, ChunkRecord
@@ -58,6 +59,12 @@ class AsyncIngestionPipeline:
         doc_dim = len(probe[0])
         query_dim = len(query_probe)
         log.info("[Embeddings] document/query dimension=%d/%d", doc_dim, query_dim)
+        checkpoint("ingestion.embedding_contract", {
+            "document_probe_dimension": doc_dim,
+            "query_probe_dimension": query_dim,
+        }, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items)
         if doc_dim != query_dim:
             raise RuntimeError(
                 f"Embedding dimension mismatch inside OllamaEmbeddings: documents={doc_dim}, query={query_dim}"
@@ -68,6 +75,12 @@ class AsyncIngestionPipeline:
             vectors = peek.get("embeddings")
             if vectors is not None and len(vectors) > 0:
                 stored_dim = len(vectors[0])
+                checkpoint("ingestion.chroma_contract", {
+                    "stored_dimension": stored_dim,
+                    "model_dimension": doc_dim,
+                }, enabled=self.cfg.debug_checkpoints,
+                           preview_chars=self.cfg.checkpoint_preview_chars,
+                           sample_items=self.cfg.checkpoint_sample_items)
                 if stored_dim != doc_dim:
                     raise RuntimeError(
                         f"Chroma collection dimension mismatch: collection={stored_dim}, model={doc_dim}. "
@@ -114,6 +127,11 @@ class AsyncIngestionPipeline:
     async def _embed_batch(self, chunks: list[ChunkRecord], doc_id: str, executor: ThreadPoolExecutor) -> None:
         loop = asyncio.get_event_loop()
         texts = [c.text for c in chunks]
+        checkpoint("ingestion.embedding_batch_input", texts,
+                   enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items,
+                   doc_id=doc_id, batch_size=len(texts))
         vectors = await loop.run_in_executor(executor, self.embeddings.embed_documents, texts)
         if len(vectors) != len(texts):
             raise RuntimeError(
@@ -122,6 +140,13 @@ class AsyncIngestionPipeline:
         expected_dim = len(vectors[0]) if vectors else 0
         if any(len(v) != expected_dim for v in vectors):
             raise RuntimeError("Embedding batch contains inconsistent vector dimensions")
+        checkpoint("ingestion.embedding_batch_output", {
+            "input_chunks": len(texts),
+            "output_vectors": len(vectors),
+            "vector_dimension": expected_dim,
+        }, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items)
         chroma_ids = [str(uuid.uuid4()) for _ in chunks]
         metadatas = []
         for chunk in chunks:
@@ -162,18 +187,44 @@ class AsyncIngestionPipeline:
                     (parent.id, doc_id, "", parent.chunk_index, parent.start_page,
                      parent.text[:200], parent.text, "parent", None, parent.end_page, parent.section_path),
                 )
+        checkpoint("ingestion.parents_stored", parents,
+                   enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items,
+                   doc_id=doc_id, parent_count=len(parents))
 
     async def _ingest_file(self, path: Path, executor: ThreadPoolExecutor) -> Optional[dict]:
         file_hash = _file_hash(path)
         if self._already_ingested(path, file_hash):
             log.info("[Ingestion] Skipping (unchanged): %s", path.name)
+            checkpoint("ingestion.file_skipped_unchanged", {
+                "filename": path.name,
+                "file_hash": file_hash,
+            }, enabled=self.cfg.debug_checkpoints,
+                       preview_chars=self.cfg.checkpoint_preview_chars,
+                       sample_items=self.cfg.checkpoint_sample_items)
             return None
 
         log.info("[Ingestion] Processing: %s", path.name)
         t0 = time.time()
         pages, page_count = await self._load_pdf_async(path, executor)
         doc_id = str(uuid.uuid4())
+        checkpoint("ingestion.pdf_loaded", {
+            "filename": path.name,
+            "doc_id": doc_id,
+            "page_count": page_count,
+            "file_hash": file_hash,
+        }, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items)
         parents, children = self.chunker.chunk(pages, doc_id)
+        checkpoint("ingestion.chunking_output", {
+            "parents": parents,
+            "children": children,
+        }, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items,
+                   parent_count=len(parents), child_count=len(children))
         if not parents or not children:
             log.warning("[Ingestion] No hierarchical chunks produced from %s", path.name)
             return None
@@ -200,16 +251,28 @@ class AsyncIngestionPipeline:
             await self._embed_batch(batch, doc_id, executor)
 
         elapsed = time.time() - t0
-        log.info("[Ingestion] ✓ %s: %d pages, %d parents, %d children in %.1fs",
-                 path.name, page_count, len(parents), len(children), elapsed)
-        return {
+        summary = {
             "filename": path.name, "pages": page_count, "parents": len(parents),
             "children": len(children), "chunks": len(children), "elapsed_s": round(elapsed, 1),
         }
+        checkpoint("ingestion.file_complete", summary,
+                   enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items)
+        log.info("[Ingestion] ✓ %s: %d pages, %d parents, %d children in %.1fs",
+                 path.name, page_count, len(parents), len(children), elapsed)
+        return summary
 
     async def run(self) -> list[dict]:
         docs_dir = Path(self.cfg.docs_dir)
         pdfs = list(docs_dir.glob("**/*.pdf"))
+        checkpoint("ingestion.run_start", {
+            "docs_dir": str(docs_dir),
+            "pdfs": [p.name for p in pdfs],
+        }, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items,
+                   pdf_count=len(pdfs), workers=self.cfg.ingest_workers)
         if not pdfs:
             log.warning("[Ingestion] No PDFs found in %s", docs_dir)
             return []
@@ -223,6 +286,11 @@ class AsyncIngestionPipeline:
                 log.error("[Ingestion] Error: %s", result)
             elif result is not None:
                 summaries.append(result)
+        checkpoint("ingestion.run_complete", summaries,
+                   enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items,
+                   ingested=len(summaries), skipped=len(pdfs) - len(summaries))
         log.info("[Ingestion] Complete: %d new files ingested, %d skipped (unchanged)",
                  len(summaries), len(pdfs) - len(summaries))
         return summaries
