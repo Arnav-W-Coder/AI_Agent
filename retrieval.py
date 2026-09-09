@@ -1,9 +1,5 @@
 """
 retrieval.py — Hybrid child retrieval: BM25 + Chroma dense + RRF + reranking.
-
-Retrieval operates on small child chunks. RRF produces retrieval candidates,
-then the pipeline performs one cross-encoder rerank after PDF and web
-candidates are merged. Reranked PDF children can then expand to parent context.
 """
 import logging
 import re
@@ -34,7 +30,6 @@ def _token_count(text: str) -> int:
 
 
 class BM25Index:
-    """In-memory BM25 index over the FULL text of retrieval children."""
     def __init__(self, db: Database, cfg: Optional[RAGConfig] = None) -> None:
         self.db = db
         self.cfg = cfg
@@ -44,27 +39,21 @@ class BM25Index:
 
     def rebuild(self) -> None:
         with self.db.connect() as conn:
-            rows = conn.execute(
-                """SELECT c.chroma_id, c.text, c.text_preview, c.page_number,
-                          c.end_page, c.doc_id, c.parent_id, c.section_path,
-                          d.filename
+            rows = conn.execute("""SELECT c.chroma_id, c.text, c.text_preview, c.page_number,
+                          c.end_page, c.doc_id, c.parent_id, c.section_path, d.filename
                    FROM chunks c JOIN documents d ON c.doc_id = d.id
-                   WHERE c.chunk_type = 'child' AND c.chroma_id <> ''"""
-            ).fetchall()
+                   WHERE c.chunk_type = 'child' AND c.chroma_id <> ''""").fetchall()
         self._chunks = [dict(r) for r in rows]
         if not self._chunks:
             self._bm25 = None
             log.info("[BM25] No child chunks — index empty")
             return
-        self._bm25 = BM25Okapi(
-            [_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks]
-        )
+        self._bm25 = BM25Okapi([_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks])
         log.info("[BM25] Index rebuilt: %d child chunks", len(self._chunks))
         checkpoint("retrieval.bm25.index_ready", self._chunks,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    enabled=getattr(self.cfg, "debug_checkpoints", True),
                     preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    indexed_children=len(self._chunks))
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3), indexed_children=len(self._chunks))
 
     def search(self, query: str, top_k: int) -> list[dict]:
         if self._bm25 is None or not self._chunks:
@@ -74,15 +63,11 @@ class BM25Index:
             return []
         scores = self._bm25.get_scores(tokens)
         top_i = np.argsort(scores)[::-1][:top_k]
-        results = [
-            {**self._chunks[i], "bm25_score": float(scores[i])}
-            for i in top_i if scores[i] > 0
-        ]
+        results = [{**self._chunks[i], "bm25_score": float(scores[i])} for i in top_i if scores[i] > 0]
         checkpoint("retrieval.bm25.search_output", results,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    enabled=getattr(self.cfg, "debug_checkpoints", True),
                     preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    query=query, requested_k=top_k, returned=len(results))
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3), query=query, requested_k=top_k, returned=len(results))
         return results
 
 
@@ -96,25 +81,19 @@ class CrossEncoderReranker:
     def rerank(self, query: str, chunks: list[dict], top_k: int, min_score: float) -> list[dict]:
         if not chunks:
             return []
-        checkpoint("retrieval.rerank_input", chunks,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
-                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    query=query, input_count=len(chunks))
-        raw_scores = self._model.predict([
-            (query, c.get("text", c.get("text_preview", ""))) for c in chunks
-        ])
+        enabled = self.cfg is None or getattr(self.cfg, "debug_checkpoints", True)
+        preview = getattr(self.cfg, "checkpoint_preview_chars", 160)
+        samples = getattr(self.cfg, "checkpoint_sample_items", 3)
+        checkpoint("retrieval.rerank_input", chunks, enabled=enabled, preview_chars=preview,
+                   sample_items=samples, query=query, input_count=len(chunks))
+        raw_scores = self._model.predict([(query, c.get("text", c.get("text_preview", ""))) for c in chunks])
         scores = np.asarray(raw_scores).reshape(-1).tolist()
         for chunk, score in zip(chunks, scores):
             chunk["rerank_score"] = round(float(score), 4)
         ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
         results = [c for c in ranked if c["rerank_score"] >= min_score][:top_k]
-        checkpoint("retrieval.rerank_output", results,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
-                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    query=query, input_count=len(chunks), returned=len(results),
-                    min_score=min_score)
+        checkpoint("retrieval.rerank_output", results, enabled=enabled, preview_chars=preview,
+                   sample_items=samples, query=query, input_count=len(chunks), returned=len(results), min_score=min_score)
         return results
 
 
@@ -141,24 +120,17 @@ class HybridRetriever:
             log.error("[Dense] ChromaDB error: %s", exc)
             return []
         chunks = []
-        for cid, text, meta, dist in zip(
-            results.get("ids", [[]])[0], results.get("documents", [[]])[0],
-            results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]
-        ):
+        for cid, text, meta, dist in zip(results.get("ids", [[]])[0], results.get("documents", [[]])[0],
+                                         results.get("metadatas", [[]])[0], results.get("distances", [[]])[0]):
             meta = meta or {}
-            chunks.append({
-                "chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
-                "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
-                "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
-                "section_path": meta.get("section_path", ""), "chunk_type": "child",
-                "dense_score": round(1 - float(dist), 4),
-            })
-        checkpoint("retrieval.dense.search_output", chunks,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
-                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    query=query, requested_k=top_k, returned=len(chunks),
-                    embedding_dimension=len(query_embedding) if 'query_embedding' in locals() else None)
+            chunks.append({"chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
+                           "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
+                           "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
+                           "section_path": meta.get("section_path", ""), "chunk_type": "child",
+                           "dense_score": round(1 - float(dist), 4)})
+        checkpoint("retrieval.dense.search_output", chunks, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+                   query=query, requested_k=top_k, returned=len(chunks), embedding_dimension=len(query_embedding) if 'query_embedding' in locals() else None)
         return chunks
 
     def _fuse(self, dense_chunks: list[dict], bm25_chunks: list[dict]) -> tuple[list[dict], set, set]:
@@ -178,72 +150,49 @@ class HybridRetriever:
                     meta = fetched.get("metadatas", [{}])[0] if fetched.get("metadatas") else {}
                 except Exception:
                     text, meta = chunk.get("text", chunk.get("text_preview", "")), {}
-                rrf[cid] = {
-                    **chunk,
-                    "text": text,
-                    "filename": meta.get("source", meta.get("filename", chunk.get("filename", ""))),
-                    "page_number": meta.get("page", chunk.get("page_number", 0)),
-                    "parent_id": meta.get("parent_id", chunk.get("parent_id", "")),
-                    "section_path": meta.get("section_path", chunk.get("section_path", "")),
-                    "rrf_score": 0.0,
-                }
+                rrf[cid] = {**chunk, "text": text,
+                            "filename": meta.get("source", meta.get("filename", chunk.get("filename", ""))),
+                            "page_number": meta.get("page", chunk.get("page_number", 0)),
+                            "parent_id": meta.get("parent_id", chunk.get("parent_id", "")),
+                            "section_path": meta.get("section_path", chunk.get("section_path", "")), "rrf_score": 0.0}
             rrf[cid]["rrf_score"] += self._rrf_score(rank)
-        candidates = sorted(rrf.values(), key=lambda c: c["rrf_score"], reverse=True)
-        candidates = candidates[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)]
-        checkpoint("retrieval.rrf.fused_output", candidates,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
-                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    dense_count=len(dense_chunks), bm25_count=len(bm25_chunks),
-                    overlap=len(dense_ids & bm25_ids), returned=len(candidates))
+        candidates = sorted(rrf.values(), key=lambda c: c["rrf_score"], reverse=True)[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)]
+        checkpoint("retrieval.rrf.fused_output", candidates, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+                   dense_count=len(dense_chunks), bm25_count=len(bm25_chunks), overlap=len(dense_ids & bm25_ids), returned=len(candidates))
         return candidates, bm25_ids, dense_ids
 
     def retrieve(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
-        """Return RRF-fused child candidates; reranking is performed once by the pipeline."""
         dense = self._dense_search(query, self.cfg.top_k_dense, metadata_filter)
         bm25 = self.bm25.search(query, self.cfg.top_k_sparse)
         candidates, bm25_ids, dense_ids = self._fuse(dense, bm25)
-        log.info(
-            "[Hybrid] candidates=%d | BM25=%d | dense=%d | overlap=%d",
-            len(candidates), len(bm25_ids), len(dense_ids), len(bm25_ids & dense_ids),
-        )
+        log.info("[Hybrid] candidates=%d | BM25=%d | dense=%d | overlap=%d", len(candidates), len(bm25_ids), len(dense_ids), len(bm25_ids & dense_ids))
         return candidates, bm25_ids, dense_ids
 
     def retrieve_candidates(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
-        """Compatibility wrapper used by the pipeline; returns child candidates only."""
         return self.retrieve(query, metadata_filter)
 
     def expand_to_context(self, children: list[dict]) -> list[dict]:
-        """Expand reranked children to parents + adjacent parent sections within budget."""
         if not children:
             return []
-        checkpoint("retrieval.context_expansion_input", children,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
-                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    child_count=len(children))
+        checkpoint("retrieval.context_expansion_input", children, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items, child_count=len(children))
         parent_ids = list(dict.fromkeys(c.get("parent_id") for c in children if c.get("parent_id")))
         if not parent_ids:
             return children
         placeholders = ",".join("?" for _ in parent_ids)
         with self.db.connect() as conn:
-            rows = conn.execute(
-                f"""SELECT id, doc_id, chunk_index, text, page_number, end_page, section_path
-                    FROM chunks WHERE chunk_type='parent' AND id IN ({placeholders})""", parent_ids
-            ).fetchall()
+            rows = conn.execute(f"""SELECT id, doc_id, chunk_index, text, page_number, end_page, section_path
+                    FROM chunks WHERE chunk_type='parent' AND id IN ({placeholders})""", parent_ids).fetchall()
             parent_map = {r["id"]: dict(r) for r in rows}
             neighbors: list[dict] = []
             for parent in rows:
                 for delta in range(1, self.cfg.context_neighbor_count + 1):
                     for idx in (parent["chunk_index"] - delta, parent["chunk_index"] + delta):
-                        row = conn.execute(
-                            """SELECT id, doc_id, chunk_index, text, page_number, end_page, section_path
-                               FROM chunks WHERE chunk_type='parent' AND doc_id=? AND chunk_index=?""",
-                            (parent["doc_id"], idx),
-                        ).fetchone()
+                        row = conn.execute("""SELECT id, doc_id, chunk_index, text, page_number, end_page, section_path
+                               FROM chunks WHERE chunk_type='parent' AND doc_id=? AND chunk_index=?""", (parent["doc_id"], idx)).fetchone()
                         if row:
                             neighbors.append(dict(row))
-
         selected: list[dict] = []
         seen: set[str] = set()
         used = 0
@@ -261,18 +210,10 @@ class HybridRetriever:
                 words = text.split()
                 text = " ".join(words[:budget])
                 tokens = _token_count(text)
-            selected.append({
-                **child,
-                "text": text,
-                "chunk_type": "parent_context",
-                "parent_id": pid,
-                "page_number": parent["page_number"],
-                "end_page": parent["end_page"],
-                "section_path": parent["section_path"],
-            })
+            selected.append({**child, "text": text, "chunk_type": "parent_context", "parent_id": pid,
+                             "page_number": parent["page_number"], "end_page": parent["end_page"], "section_path": parent["section_path"]})
             used += tokens
             seen.add(pid)
-
         for neighbor in neighbors:
             nid = neighbor["id"]
             if nid in seen:
@@ -281,25 +222,13 @@ class HybridRetriever:
             tokens = _token_count(text)
             if used + tokens > budget:
                 continue
-            selected.append({
-                "text": text,
-                "filename": neighbor.get("doc_id", ""),
-                "page_number": neighbor["page_number"],
-                "end_page": neighbor["end_page"],
-                "section_path": neighbor["section_path"],
-                "doc_id": neighbor["doc_id"],
-                "parent_id": nid,
-                "chunk_type": "neighbor_context",
-                "rerank_score": 0.0,
-                "rrf_score": 0.0,
-            })
+            selected.append({"text": text, "filename": neighbor.get("doc_id", ""), "page_number": neighbor["page_number"],
+                             "end_page": neighbor["end_page"], "section_path": neighbor["section_path"], "doc_id": neighbor["doc_id"],
+                             "parent_id": nid, "chunk_type": "neighbor_context", "rerank_score": 0.0, "rrf_score": 0.0})
             used += tokens
             seen.add(nid)
         result = selected or children
-        checkpoint("retrieval.context_expansion_output", result,
-                    enabled=getattr(self.cfg, "debug_checkpoints", False),
-                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
-                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
-                    parent_count=len(parent_ids), returned=len(result), context_budget_tokens=budget,
-                    context_tokens_used=used)
+        checkpoint("retrieval.context_expansion_output", result, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+                   parent_count=len(parent_ids), returned=len(result), context_budget_tokens=budget, context_tokens_used=used)
         return result
