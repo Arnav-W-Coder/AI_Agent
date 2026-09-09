@@ -5,8 +5,7 @@ import json
 import logging
 import time
 import uuid
-from pathlib import Path
-from typing import Optional
+from urllib.parse import urlsplit
 
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
@@ -20,7 +19,7 @@ _COLLECTION = "web_cache"
 
 
 class WebChunkStore:
-    """Persistent, TTL-aware web chunk store."""
+    """Persistent, TTL-aware web chunk store with explicit source provenance."""
 
     def __init__(self, db: Database, cfg: RAGConfig, embeddings: OllamaEmbeddings) -> None:
         self.db = db
@@ -82,8 +81,17 @@ class WebChunkStore:
         expires_at = now + self.cfg.web_chunk_ttl_hours * 3600
         chunk_ids = [str(uuid.uuid4()) for _ in docs]
         texts = [d.page_content for d in docs]
+        domain = urlsplit(url).hostname or ""
         metadatas = [
-            {"source": url, "title": title, "scraped_at": now, "expires_at": expires_at}
+            {
+                "source": url,
+                "source_url": url,
+                "domain": domain,
+                "title": title,
+                "source_type": "web",
+                "scraped_at": now,
+                "expires_at": expires_at,
+            }
             for _ in docs
         ]
 
@@ -132,10 +140,13 @@ class WebChunkStore:
                 "chroma_id": cid,
                 "text": text or "",
                 "filename": (meta or {}).get("source", "web"),
+                "source_url": (meta or {}).get("source_url") or (meta or {}).get("source", ""),
+                "domain": (meta or {}).get("domain", ""),
                 "page_number": 0,
                 "rerank_score": round(float(1 - distance), 3),
                 "source_type": "web",
                 "title": (meta or {}).get("title", ""),
+                "scraped_at": (meta or {}).get("scraped_at"),
             }
             for cid, text, meta, distance in zip(ids, docs, metas, distances)
         ]
