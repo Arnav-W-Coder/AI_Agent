@@ -15,6 +15,7 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 from langchain_chroma import Chroma
 
+from checkpoints import checkpoint
 from config import RAGConfig
 from db import Database
 
@@ -34,8 +35,9 @@ def _token_count(text: str) -> int:
 
 class BM25Index:
     """In-memory BM25 index over the FULL text of retrieval children."""
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, cfg: Optional[RAGConfig] = None) -> None:
         self.db = db
+        self.cfg = cfg
         self._chunks: list[dict] = []
         self._bm25: Optional[BM25Okapi] = None
         self.rebuild()
@@ -58,6 +60,11 @@ class BM25Index:
             [_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks]
         )
         log.info("[BM25] Index rebuilt: %d child chunks", len(self._chunks))
+        checkpoint("retrieval.bm25.index_ready", self._chunks,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    indexed_children=len(self._chunks))
 
     def search(self, query: str, top_k: int) -> list[dict]:
         if self._bm25 is None or not self._chunks:
@@ -67,21 +74,33 @@ class BM25Index:
             return []
         scores = self._bm25.get_scores(tokens)
         top_i = np.argsort(scores)[::-1][:top_k]
-        return [
+        results = [
             {**self._chunks[i], "bm25_score": float(scores[i])}
             for i in top_i if scores[i] > 0
         ]
+        checkpoint("retrieval.bm25.search_output", results,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    query=query, requested_k=top_k, returned=len(results))
+        return results
 
 
 class CrossEncoderReranker:
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, cfg: Optional[RAGConfig] = None) -> None:
         log.info("[Reranker] Loading cross-encoder: %s", model_name)
         self._model = CrossEncoder(model_name)
+        self.cfg = cfg
         log.info("[Reranker] Ready")
 
     def rerank(self, query: str, chunks: list[dict], top_k: int, min_score: float) -> list[dict]:
         if not chunks:
             return []
+        checkpoint("retrieval.rerank_input", chunks,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    query=query, input_count=len(chunks))
         raw_scores = self._model.predict([
             (query, c.get("text", c.get("text_preview", ""))) for c in chunks
         ])
@@ -89,7 +108,14 @@ class CrossEncoderReranker:
         for chunk, score in zip(chunks, scores):
             chunk["rerank_score"] = round(float(score), 4)
         ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
-        return [c for c in ranked if c["rerank_score"] >= min_score][:top_k]
+        results = [c for c in ranked if c["rerank_score"] >= min_score][:top_k]
+        checkpoint("retrieval.rerank_output", results,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    query=query, input_count=len(chunks), returned=len(results),
+                    min_score=min_score)
+        return results
 
 
 class HybridRetriever:
@@ -127,6 +153,12 @@ class HybridRetriever:
                 "section_path": meta.get("section_path", ""), "chunk_type": "child",
                 "dense_score": round(1 - float(dist), 4),
             })
+        checkpoint("retrieval.dense.search_output", chunks,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    query=query, requested_k=top_k, returned=len(chunks),
+                    embedding_dimension=len(query_embedding) if 'query_embedding' in locals() else None)
         return chunks
 
     def _fuse(self, dense_chunks: list[dict], bm25_chunks: list[dict]) -> tuple[list[dict], set, set]:
@@ -157,7 +189,14 @@ class HybridRetriever:
                 }
             rrf[cid]["rrf_score"] += self._rrf_score(rank)
         candidates = sorted(rrf.values(), key=lambda c: c["rrf_score"], reverse=True)
-        return candidates[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)], bm25_ids, dense_ids
+        candidates = candidates[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)]
+        checkpoint("retrieval.rrf.fused_output", candidates,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    dense_count=len(dense_chunks), bm25_count=len(bm25_chunks),
+                    overlap=len(dense_ids & bm25_ids), returned=len(candidates))
+        return candidates, bm25_ids, dense_ids
 
     def retrieve(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
         """Return RRF-fused child candidates; reranking is performed once by the pipeline."""
@@ -178,6 +217,11 @@ class HybridRetriever:
         """Expand reranked children to parents + adjacent parent sections within budget."""
         if not children:
             return []
+        checkpoint("retrieval.context_expansion_input", children,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    child_count=len(children))
         parent_ids = list(dict.fromkeys(c.get("parent_id") for c in children if c.get("parent_id")))
         if not parent_ids:
             return children
@@ -251,4 +295,11 @@ class HybridRetriever:
             })
             used += tokens
             seen.add(nid)
-        return selected or children
+        result = selected or children
+        checkpoint("retrieval.context_expansion_output", result,
+                    enabled=getattr(self.cfg, "debug_checkpoints", False),
+                    preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
+                    sample_items=getattr(self.cfg, "checkpoint_sample_items", 3),
+                    parent_count=len(parent_ids), returned=len(result), context_budget_tokens=budget,
+                    context_tokens_used=used)
+        return result
