@@ -1,13 +1,5 @@
 """
 critic.py — Multi-dimensional RAG quality control and bounded repair.
-
-The critic evaluates a generated answer across three dimensions:
-  1. groundedness: are factual claims supported by retrieved context?
-  2. completeness: does the answer address the user's question using available evidence?
-  3. relevance: is the retrieved context actually useful for the question?
-
-The public methods remain backward-compatible with the existing pipeline while
-supporting the richer question-aware interface for future callers.
 """
 import logging
 import re
@@ -19,6 +11,8 @@ if TYPE_CHECKING:
     from config import RAGConfig
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
+from checkpoints import checkpoint
 
 log = logging.getLogger(__name__)
 
@@ -106,11 +100,6 @@ class CriticAndRepair:
         self.last_details: dict = {}
 
     def check(self, *args) -> tuple[str, str, float]:
-        """Evaluate relevance, groundedness, and completeness.
-
-        Supports both check(question, context, answer) and the legacy
-        check(context, answer) signature used by the current pipeline.
-        """
         if len(args) == 3:
             question, context, answer = args
         elif len(args) == 2:
@@ -118,6 +107,14 @@ class CriticAndRepair:
             context, answer = args
         else:
             raise TypeError("check() expects (question, context, answer) or (context, answer)")
+
+        checkpoint("critic.input", {
+            "question": question,
+            "context": context,
+            "answer": answer,
+        }, enabled=getattr(self._cfg, "debug_checkpoints", True),
+                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
+                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
 
         if not context or not context.strip():
             log.info("[Critic] No context — FAIL")
@@ -133,10 +130,18 @@ class CriticAndRepair:
             "context": context,
             "answer": answer,
         }).strip()
-        return self._parse_critic_output(raw)
+        checkpoint("critic.raw_output", raw, enabled=getattr(self._cfg, "debug_checkpoints", True),
+                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
+                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
+        result = self._parse_critic_output(raw)
+        checkpoint("critic.evaluation", {
+            "verdict": result[0], "issues": result[1], "score": result[2], **self.last_details,
+        }, enabled=getattr(self._cfg, "debug_checkpoints", True),
+                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
+                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
+        return result
 
     def repair(self, *args) -> str:
-        """Repair using either the new or legacy argument order."""
         if len(args) == 4:
             question, context, answer, issues = args
         elif len(args) == 3:
@@ -145,40 +150,49 @@ class CriticAndRepair:
         else:
             raise TypeError("repair() expects (question, context, answer, issues) or (context, answer, issues)")
 
+        checkpoint("critic.repair_input", {
+            "question": question, "context": context, "answer": answer, "issues": issues,
+        }, enabled=getattr(self._cfg, "debug_checkpoints", True),
+                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
+                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
         log.info("[Repair] Reworking flagged issue(s)...")
         repaired = self._repair_chain.invoke({
             "question": question or "Answer the user's question only from the supplied context.",
-            "context": context,
-            "answer": answer,
-            "issues": issues,
+            "context": context, "answer": answer, "issues": issues,
         }).strip()
         repaired = self._strip_meta_commentary(repaired)
         if not repaired or len(repaired) < 5:
             log.warning("[Repair] Empty repair — using grounded fallback")
             return "I don't have enough information to answer this confidently."
+        checkpoint("critic.repair_output", repaired, enabled=getattr(self._cfg, "debug_checkpoints", True),
+                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
+                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3),
+                   chars_before=len(answer), chars_after=len(repaired))
         log.info("[Repair] Done. Length: %d → %d chars", len(answer), len(repaired))
         return repaired
 
     def polish(self, answer: str) -> str:
-        """Deterministically remove meta-commentary and hedges."""
         if self._is_uncertainty_response(answer):
-            return "The available sources do not contain enough information to answer this question."
-        patterns = [
-            r"\bBased on (?:the )?(?:provided|retrieved) (?:context|sources),?\s*",
-            r"\bAccording to (?:the )?(?:provided|retrieved) (?:context|sources),?\s*",
-            r"\bThe context suggests that\s*", r"\bIt appears that\s*",
-            r"\bIt seems that\s*",
-        ]
-        cleaned = answer
-        for pattern in patterns:
-            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
-        cleaned = self._strip_meta_commentary(cleaned)
-        return cleaned.strip() or answer
+            result = "The available sources do not contain enough information to answer this question."
+        else:
+            patterns = [
+                r"\bBased on (?:the )?(?:provided|retrieved) (?:context|sources),?\s*",
+                r"\bAccording to (?:the )?(?:provided|retrieved) (?:context|sources),?\s*",
+                r"\bThe context suggests that\s*", r"\bIt appears that\s*", r"\bIt seems that\s*",
+            ]
+            result = answer
+            for pattern in patterns:
+                result = re.sub(pattern, "", result, flags=re.IGNORECASE)
+            result = self._strip_meta_commentary(result).strip() or answer
+        checkpoint("critic.polish_output", result, enabled=getattr(self._cfg, "debug_checkpoints", True),
+                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
+                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
+        return result
 
     def compute_faithfulness(self, verdict: str, claims: str) -> float:
         if verdict == "GROUNDED":
             return 1.0
-        penalty = self._cfg.critic_claim_penalty if self._cfg is not None else 0.20
+        penalty = getattr(self._cfg, "critic_claim_penalty", 0.20)
         n_claims = max(1, claims.count("\n- ") or claims.count("•"))
         return max(0.0, round(1.0 - penalty * n_claims, 2))
 
@@ -186,40 +200,24 @@ class CriticAndRepair:
         sentences = [s.strip() for s in re.split(r"[.!?]+", answer) if s.strip()]
         if not sentences:
             return False
-        uncertainty_count = sum(
-            1 for sentence in sentences
-            if any(phrase in sentence.lower() for phrase in UNCERTAINTY_PHRASES)
-        )
-        threshold = self._cfg.critic_uncertainty_threshold if self._cfg is not None else 0.50
+        uncertainty_count = sum(1 for sentence in sentences if any(phrase in sentence.lower() for phrase in UNCERTAINTY_PHRASES))
+        threshold = getattr(self._cfg, "critic_uncertainty_threshold", 0.50)
         return uncertainty_count / len(sentences) >= threshold
 
     def _parse_critic_output(self, raw: str) -> tuple[str, str, float]:
         def field(name: str, default: str = "FAIL") -> str:
-            match = re.search(
-                rf"^{name}:\s*(PASS|FAIL)\b", raw,
-                flags=re.IGNORECASE | re.MULTILINE,
-            )
+            match = re.search(rf"^{name}:\s*(PASS|FAIL)\b", raw, flags=re.IGNORECASE | re.MULTILINE)
             return match.group(1).upper() if match else default
-
         groundedness = field("GROUNDEDNESS")
         completeness = field("COMPLETENESS")
         relevance = field("RELEVANCE")
-        score_match = re.search(
-            r"^SCORE:\s*(0(?:\.\d+)?|1(?:\.0+)?)\b", raw,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
+        score_match = re.search(r"^SCORE:\s*(0(?:\.\d+)?|1(?:\.0+)?)\b", raw, flags=re.IGNORECASE | re.MULTILINE)
         score = float(score_match.group(1)) if score_match else (1.0 if groundedness == "PASS" else 0.0)
-
         issues_match = re.search(r"ISSUES:\s*(.*)$", raw, flags=re.IGNORECASE | re.DOTALL)
         issues = issues_match.group(1).strip() if issues_match else "- Critic returned no parseable issue details."
         if issues.upper() == "- NONE":
             issues = ""
-
-        self.last_details = {
-            "groundedness": groundedness,
-            "completeness": completeness,
-            "relevance": relevance,
-        }
+        self.last_details = {"groundedness": groundedness, "completeness": completeness, "relevance": relevance}
         failed = [value for value in self.last_details.values() if value == "FAIL"]
         verdict = "GROUNDED" if not failed else "HALLUCINATED"
         return verdict, issues, round(max(0.0, min(1.0, score)), 2)
@@ -232,15 +230,13 @@ class CriticAndRepair:
         kept = []
         for line in lines:
             low = line.strip().lower()
-            if (
-                low.startswith("note: i removed")
+            if (low.startswith("note: i removed")
                 or low.startswith("note: no additional information was added")
                 or low.startswith("i removed the unsupported")
                 or low.startswith("the answer was repaired")
                 or low.startswith("i preserved the supported")
                 or low.startswith("i reworked the unsupported")
-                or low.startswith("no additional information was added")
-            ):
+                or low.startswith("no additional information was added")):
                 continue
             kept.append(line)
         return "\n".join(kept).strip()
