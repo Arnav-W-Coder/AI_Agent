@@ -65,50 +65,69 @@ class WebChunkStore:
         return fresh
 
     def upsert(self, url: str, title: str, text: str) -> int:
-        if self.is_fresh(url):
-            log.info("[WebStore] Cache hit — skipping re-embed: %s", url[:70])
-            return 0
-        if not text or text.startswith("Error:"):
+        return self.upsert_batch([(url, title, text)])
+
+    def upsert_batch(self, pages: list[tuple[str, str, str]]) -> int:
+        """Embed and persist multiple pages in batches instead of one request per page."""
+        pending = []
+        for url, title, text in pages:
+            if self.is_fresh(url):
+                log.info("[WebStore] Cache hit — skipping re-embed: %s", url[:70])
+                continue
+            if not text or text.startswith("Error:"):
+                continue
+            docs = self._splitter.create_documents([text])
+            for doc in docs:
+                pending.append((url, title, doc.page_content))
+
+        if not pending:
             return 0
 
-        docs = self._splitter.create_documents([text])
-        checkpoint("web_store.upsert_chunks", docs, enabled=self.cfg.debug_checkpoints,
-                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
-                   url=url, title=title, chunk_count=len(docs))
-        if not docs:
-            return 0
         self._maybe_evict_oldest()
         now = time.time()
         expires_at = now + self.cfg.web_chunk_ttl_hours * 3600
-        chunk_ids = [str(uuid.uuid4()) for _ in docs]
-        texts = [d.page_content for d in docs]
-        domain = urlsplit(url).hostname or ""
+        chunk_ids = [str(uuid.uuid4()) for _ in pending]
+        texts = [item[2] for item in pending]
         metadatas = [{
-            "source": url, "source_url": url, "domain": domain, "title": title,
+            "source": url, "source_url": url,
+            "domain": urlsplit(url).hostname or "", "title": title,
             "source_type": "web", "scraped_at": now, "expires_at": expires_at,
-        } for _ in docs]
+        } for url, title, _ in pending]
 
+        embeddings_list = []
+        batch_size = max(1, int(self.cfg.web_embed_batch_size))
         try:
-            embeddings_list = self.embeddings.embed_documents(texts)
-            checkpoint("web_store.embedding_output", {
-                "chunks": len(texts), "vectors": len(embeddings_list),
-                "dimension": len(embeddings_list[0]) if embeddings_list else 0,
-            }, enabled=self.cfg.debug_checkpoints,
-                       preview_chars=self.cfg.checkpoint_preview_chars,
-                       sample_items=self.cfg.checkpoint_sample_items, url=url)
-            self._chroma._collection.upsert(ids=chunk_ids, documents=texts, embeddings=embeddings_list, metadatas=metadatas)
+            for start in range(0, len(texts), batch_size):
+                batch = texts[start:start + batch_size]
+                vectors = self.embeddings.embed_documents(batch)
+                embeddings_list.extend(vectors)
+                checkpoint("web_store.embedding_batch", {
+                    "start": start, "batch_size": len(batch),
+                    "vectors": len(vectors),
+                    "dimension": len(vectors[0]) if vectors else 0,
+                }, enabled=self.cfg.debug_checkpoints,
+                           preview_chars=self.cfg.checkpoint_preview_chars,
+                           sample_items=self.cfg.checkpoint_sample_items)
+            if len(embeddings_list) != len(texts):
+                raise RuntimeError("Embedding count did not match web chunk count")
+            self._chroma._collection.upsert(ids=chunk_ids, documents=texts,
+                                            embeddings=embeddings_list, metadatas=metadatas)
         except Exception as exc:
-            log.error("[WebStore] Chroma upsert failed for %s: %s", url, exc)
+            log.error("[WebStore] Chroma batch upsert failed: %s", exc)
             return 0
 
+        by_url = {}
+        for chunk_id, (url, title, _) in zip(chunk_ids, pending):
+            by_url.setdefault((url, title), []).append(chunk_id)
         with self.db.connect() as conn:
-            conn.execute("""INSERT OR REPLACE INTO web_scrape_cache
-                   (url, title, scraped_at, expires_at, chunk_count, chunk_ids)
-                   VALUES (?, ?, ?, ?, ?, ?)""", (url, title, now, expires_at, len(chunk_ids), json.dumps(chunk_ids)))
-        checkpoint("web_store.upsert_complete", {"url": url, "title": title}, enabled=self.cfg.debug_checkpoints,
-                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
-                   chunks_added=len(docs), domain=domain)
-        return len(docs)
+            for (url, title), ids in by_url.items():
+                conn.execute("""INSERT OR REPLACE INTO web_scrape_cache
+                       (url, title, scraped_at, expires_at, chunk_count, chunk_ids)
+                       VALUES (?, ?, ?, ?, ?, ?)""", (url, title, now, expires_at, len(ids), json.dumps(ids)))
+        checkpoint("web_store.upsert_complete", {"urls": len(by_url), "chunks": len(pending)},
+                   enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items)
+        return len(pending)
 
     def search(self, query: str, k: int) -> list[dict]:
         n_total = self._chroma._collection.count()
