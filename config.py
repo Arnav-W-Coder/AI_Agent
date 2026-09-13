@@ -24,30 +24,15 @@ class RAGConfig:
     ctx_window: int = 16384
     max_answer_chars: int = 5000
 
-    # Hierarchical chunking
-    semantic_chunking_enabled: bool = True
-    semantic_breakpoint_percentile: float = 75.0
-    semantic_min_distance: float = 0.10
-    semantic_min_paragraph_tokens: int = 20
-    semantic_min_block_tokens: int = 80
-    parent_target_tokens: int = 900
-    parent_max_tokens: int = 1200
-    child_max_tokens: int = 220
-    child_overlap_tokens: int = 30
-    context_budget_tokens: int = 7000
-    context_neighbor_count: int = 1
-    chunk_size: int = 800
-    chunk_overlap: int = 150
-
     # Retrieval
     top_k_dense: int = 20
     top_k_sparse: int = 20
     top_k_rerank: int = 5
     rrf_k: int = 60
     min_rerank_score: float = -8.0
-    min_mean_rerank_score: float = 0.25
-    min_top_rerank_score: float = 0.75
-    retrieval_quality_margin: float = 0.20
+    min_mean_rerank_score: float = 0.0
+    min_top_rerank_score: float = 0.0
+    retrieval_quality_margin: float = 0.0
     low_confidence_pdf_limit: int = 5
     require_retrieval_evidence: bool = True
 
@@ -78,9 +63,9 @@ class RAGConfig:
     # Web scraping
     max_scrape_urls: int = 5
     ddg_retries: int = 3
-    min_domain_score: int = 30
+    min_domain_score: int = 65
     web_top_k: int = 6
-    always_scrape_web: bool = True
+    always_scrape_web: bool = False
     web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
     web_chunk_ttl_hours: int = 24
     web_collection_max_chunks: int = 8000
@@ -92,12 +77,16 @@ class RAGConfig:
         "docs.python.org", "developer.mozilla.org", "docs.oracle.com",
         "kernel.org", "llvm.org", "gnu.org", "iso.org", "arxiv.org",
     )
+    url_evaluator_enabled: bool = True
+    url_evaluator_min_domain_score: int = 65
+    url_evaluator_max_redirects: int = 5
 
     # Critic
     critic_enabled: bool = True
     critic_on_low_confidence_only: bool = True
     critic_uncertainty_threshold: float = 0.50
     critic_claim_penalty: float = 0.20
+    critic_polish_enabled: bool = False
 
     # Rewriter
     rewrite_enabled: bool = True
