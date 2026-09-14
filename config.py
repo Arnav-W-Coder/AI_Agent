@@ -48,6 +48,7 @@ class RAGConfig:
     embed_batch_size: int = 16
     ingest_workers: int = 4
     web_embed_batch_size: int = 32
+    context_neighbor_count: int = 1
 
     # Monitoring / drift
     drift_window: int = 50
@@ -93,3 +94,23 @@ class RAGConfig:
     rewrite_only_when_ambiguous: bool = True
     rewriter_helpful_min_score: float = 0.80
     rewriter_unhelpful_max_score: float = 0.40
+
+    # Chunking
+    chunk_size: int = 500
+    chunk_overlap: int = 75
+
+    # Semantic chunking
+    semantic_chunking_enabled: bool = True
+    semantic_breakpoint_percentile: float = 90.0
+    semantic_min_distance: float = 0.0
+    semantic_min_block_tokens: int = 80
+
+    # Hierarchical chunking
+    parent_target_tokens: int = 600
+    parent_max_tokens: int = 900
+    child_max_tokens: int = 220
+    child_overlap_tokens: int = 40
+
+    # Context expansion
+    context_neighbor_count: int = 1
+    context_budget_tokens: int = 6000

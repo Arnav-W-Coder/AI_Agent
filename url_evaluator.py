@@ -44,10 +44,24 @@ def evaluate_url(url: str, *, min_domain_score: int = 65) -> dict:
     """Return a decision before fetching, embedding, or persisting a URL."""
     normalized = normalize_url(url)
     if not normalized:
-        return {"approved": False, "reason": "invalid_or_blocked_url", "url": None}
+        return {
+            "approved": False,
+            "reason": "invalid_or_blocked_url",
+            "url": None,
+            "normalized_url": None,
+            "host": None,
+            "domain_score": 0,
+        }
     host = urlsplit(normalized).hostname or ""
     if not public_host(host):
-        return {"approved": False, "reason": "non_public_host", "url": normalized}
+        return {
+            "approved": False,
+            "reason": "non_public_host",
+            "url": normalized,
+            "normalized_url": normalized,
+            "host": host,
+            "domain_score": 0,
+        }
     labels = host.split(".")
     score = 92 if labels[-1] in {"gov", "edu"} else 60
     known = {
@@ -67,6 +81,7 @@ def evaluate_url(url: str, *, min_domain_score: int = 65) -> dict:
         "approved": score >= min_domain_score,
         "reason": "approved" if score >= min_domain_score else "low_domain_authority",
         "url": normalized,
+        "normalized_url": normalized,
         "host": host,
         "domain_score": score,
     }

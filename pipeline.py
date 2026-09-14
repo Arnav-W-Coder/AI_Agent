@@ -466,16 +466,16 @@ class ProductionRAGPipeline:
                     min_domain_score=self.cfg.url_evaluator_min_domain_score,
                 )
 
-                if not decision.approved:
+                if not decision["approved"]:
                     rejected_urls += 1
                     log.info(
                         "[WebScrape] URL rejected before fetch: %s | reason=%s",
                         original_url,
-                        decision.reason,
+                        decision["reason"],
                     )
                     continue
 
-                normalized_url = decision.normalized_url
+                normalized_url = decision["normalized_url"]
             else:
                 normalized_url = _normalize_url(original_url)
 
@@ -554,15 +554,15 @@ class ProductionRAGPipeline:
                 min_domain_score=self.cfg.url_evaluator_min_domain_score,
             )
 
-            if not decision.approved:
+            if not decision["approved"]:
                 log.info(
                     "[WebScrape] Fetch blocked by URL evaluator: %s | reason=%s",
                     url,
-                    decision.reason,
+                    decision["reason"],
                 )
                 return None
 
-            normalized = decision.normalized_url
+            normalized = decision.get("normalized_url") or decision.get("url")
         else:
             normalized = _normalize_url(url)
 
@@ -598,16 +598,16 @@ class ProductionRAGPipeline:
                                 min_domain_score=self.cfg.url_evaluator_min_domain_score,
                             )
 
-                            if not redirect_decision.approved:
+                            if not redirect_decision["approved"]:
                                 log.warning(
                                     "[WebScrape] Rejected unsafe redirect: %s -> %s | reason=%s",
                                     current_url,
                                     next_url,
-                                    redirect_decision.reason,
+                                    redirect_decision["reason"],
                                 )
                                 return None
 
-                            next_url = redirect_decision.normalized_url
+                            next_url = redirect_decision.get("normalized_url") or redirect_decision.get("url")
                         else:
                             next_url = _normalize_url(next_url)
 
