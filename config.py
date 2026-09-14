@@ -69,7 +69,7 @@ class RAGConfig:
     web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
     web_chunk_ttl_hours: int = 24
     web_collection_max_chunks: int = 8000
-    web_fetch_workers: int = 5
+    web_fetch_workers: int = 4
     web_request_timeout_seconds: int = 12
     web_min_text_chars: int = 400
     web_authoritative_domains: tuple[str, ...] = (

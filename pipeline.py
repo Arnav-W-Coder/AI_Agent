@@ -27,6 +27,7 @@ from metrics import MetricsRecorder, QueryTrace
 from retrieval import BM25Index, CrossEncoderReranker, HybridRetriever
 from rewriter import QueryRewriter
 from web_store import WebChunkStore
+from url_evaluator import evaluate_url
 
 log = logging.getLogger(__name__)
 
@@ -256,7 +257,8 @@ class ProductionRAGPipeline:
             trace.t_retrieval = trace.t_rerank = time.time()
         else:
             log.info("[Query] Starting PDF + web retrieval...")
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            outer_workers = max(2, int(self.cfg.web_fetch_workers) + 1)
+            with ThreadPoolExecutor(max_workers=outer_workers) as pool:
                 pdf_fut = pool.submit(self.retriever.retrieve_candidates, rewritten, metadata_filter)
                 web_fut = (pool.submit(self._web_scrape_chunks, rewritten)
                            if use_web_fallback and self.cfg.always_scrape_web else None)
@@ -433,30 +435,144 @@ class ProductionRAGPipeline:
                 time.sleep(2 ** attempt)
 
         approved = _select_web_results(raw, self.cfg.max_scrape_urls)
-        new_chunks = 0
+        # new_chunks = 0
+        # for result in approved:
+        #     original_url = result["href"]
+        #     if not _host_is_public(urlsplit(original_url).hostname or ""):
+        #         log.warning("[WebScrape] Rejected non-public URL: %s", original_url)
+        #         continue
+        #     fetched = self._fetch_verified_url(original_url)
+        #     if not fetched:
+        #         continue
+        #     canonical_url, title, text = fetched
+        #     if self.web_store.is_fresh(canonical_url):
+        #         continue
+        #     new_chunks += self.web_store.upsert(canonical_url, title or result.get("title", "Web"), text)
+        
+        # log.info("[WebScrape] %d new chunks added to persistent store", new_chunks)
+        # return self.web_store.search(query, k=self.cfg.web_top_k)
+
+        # Evaluate and deduplicate URLs before making any HTTP requests.
+        candidates = []
+        seen_urls = set()
+        rejected_urls = 0
+
         for result in approved:
-            original_url = result["href"]
-            if not _host_is_public(urlsplit(original_url).hostname or ""):
-                log.warning("[WebScrape] Rejected non-public URL: %s", original_url)
+            original_url = result.get("href", "")
+
+            if self.cfg.url_evaluator_enabled:
+                decision = evaluate_url(
+                    original_url,
+                    min_domain_score=self.cfg.url_evaluator_min_domain_score,
+                )
+
+                if not decision.approved:
+                    rejected_urls += 1
+                    log.info(
+                        "[WebScrape] URL rejected before fetch: %s | reason=%s",
+                        original_url,
+                        decision.reason,
+                    )
+                    continue
+
+                normalized_url = decision.normalized_url
+            else:
+                normalized_url = _normalize_url(original_url)
+
+            if not normalized_url or normalized_url in seen_urls:
                 continue
-            fetched = self._fetch_verified_url(original_url)
-            if not fetched:
-                continue
+
+            seen_urls.add(normalized_url)
+
+            result_copy = dict(result)
+            result_copy["href"] = normalized_url
+            candidates.append(result_copy)
+
+        log.info(
+            "[WebScrape] URL evaluation: %d approved, %d rejected, %d unique",
+            len(candidates),
+            rejected_urls,
+            len(seen_urls),
+        )
+
+        # Fetch approved URLs concurrently.
+        fetch_workers = max(1, int(self.cfg.web_fetch_workers))
+        fetched_results = []
+
+        with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
+            futures = {
+                pool.submit(self._fetch_verified_url, result["href"]): result
+                for result in candidates
+            }
+
+            for future in futures:
+                result = futures[future]
+                try:
+                    fetched = future.result()
+                except Exception as exc:
+                    log.warning(
+                        "[WebScrape] Fetch failed for %s: %s",
+                        result["href"],
+                        exc,
+                    )
+                    continue
+
+                if fetched:
+                    fetched_results.append((result, fetched))
+
+        # Persist sequentially unless WebChunkStore is explicitly thread-safe.
+        new_chunks = 0
+
+        for result, fetched in fetched_results:
             canonical_url, title, text = fetched
+
             if self.web_store.is_fresh(canonical_url):
                 continue
-            new_chunks += self.web_store.upsert(canonical_url, title or result.get("title", "Web"), text)
-        log.info("[WebScrape] %d new chunks added to persistent store", new_chunks)
+
+            new_chunks += self.web_store.upsert(
+                canonical_url,
+                title or result.get("title", "Web"),
+                text,
+            )
+
+        log.info(
+            "[WebScrape] Fetched %d/%d approved URLs; %d new chunks added",
+            len(fetched_results),
+            len(candidates),
+            new_chunks,
+        )
+
         return self.web_store.search(query, k=self.cfg.web_top_k)
 
     def _fetch_verified_url(self, url: str, char_limit: int = 2500):
-        normalized = _normalize_url(url)
+        # normalized = _normalize_url(url)
+        # if not normalized:
+        #     return None
+        if self.cfg.url_evaluator_enabled:
+            decision = evaluate_url(
+                url,
+                min_domain_score=self.cfg.url_evaluator_min_domain_score,
+            )
+
+            if not decision.approved:
+                log.info(
+                    "[WebScrape] Fetch blocked by URL evaluator: %s | reason=%s",
+                    url,
+                    decision.reason,
+                )
+                return None
+
+            normalized = decision.normalized_url
+        else:
+            normalized = _normalize_url(url)
+
         if not normalized:
             return None
         try:
             current_url = normalized
             with requests.Session() as session:
-                for _hop in range(6):
+                # for _hop in range(6):
+                for _hop in range(self.cfg.url_evaluator_max_redirects + 1):
                     if not _host_is_public(urlsplit(current_url).hostname or ""):
                         log.warning("[WebScrape] Rejected non-public redirect target: %s", current_url)
                         return None
@@ -470,9 +586,39 @@ class ProductionRAGPipeline:
                         location = resp.headers.get("Location")
                         if not location:
                             return None
-                        next_url = _normalize_url(urljoin(current_url, location))
-                        if not next_url or not _host_is_public(urlsplit(next_url).hostname or ""):
-                            log.warning("[WebScrape] Rejected unsafe redirect: %s -> %s", current_url, location)
+                        # next_url = _normalize_url(urljoin(current_url, location))
+                        # if not next_url or not _host_is_public(urlsplit(next_url).hostname or ""):
+                        #     log.warning("[WebScrape] Rejected unsafe redirect: %s -> %s", current_url, location)
+                        #     return None
+                        next_url = urljoin(current_url, location)
+
+                        if self.cfg.url_evaluator_enabled:
+                            redirect_decision = evaluate_url(
+                                next_url,
+                                min_domain_score=self.cfg.url_evaluator_min_domain_score,
+                            )
+
+                            if not redirect_decision.approved:
+                                log.warning(
+                                    "[WebScrape] Rejected unsafe redirect: %s -> %s | reason=%s",
+                                    current_url,
+                                    next_url,
+                                    redirect_decision.reason,
+                                )
+                                return None
+
+                            next_url = redirect_decision.normalized_url
+                        else:
+                            next_url = _normalize_url(next_url)
+
+                        if not next_url or not _host_is_public(
+                            urlsplit(next_url).hostname or ""
+                        ):
+                            log.warning(
+                                "[WebScrape] Rejected unsafe redirect: %s -> %s",
+                                current_url,
+                                next_url,
+                            )
                             return None
                         current_url = next_url
                         continue
@@ -499,7 +645,12 @@ class ProductionRAGPipeline:
                     if len(text) > char_limit:
                         text = text[:char_limit] + "\n[truncated]"
                     return final_url, title, text
-                log.warning("[WebScrape] Rejected redirect chain exceeding 5 hops: %s", normalized)
+                # log.warning("[WebScrape] Rejected redirect chain exceeding 5 hops: %s", normalized)
+                log.warning(
+                    "[WebScrape] Rejected redirect chain exceeding %d hops: %s",
+                    self.cfg.url_evaluator_max_redirects,
+                    normalized,
+                )
                 return None
         except (requests.RequestException, UnicodeError, ValueError, OSError) as exc:
             log.warning("[WebScrape] Fetch rejected %s: %s", normalized, exc)
