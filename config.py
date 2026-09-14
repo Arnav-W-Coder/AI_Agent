@@ -99,6 +99,17 @@ class RAGConfig:
     chunk_size: int = 500
     chunk_overlap: int = 75
 
+    # Semantic chunking / context expansion
+    semantic_chunking_enabled: bool = True
+    semantic_breakpoint_percentile: float = 75.0
+    semantic_min_distance: float = 0.10
+    semantic_min_block_tokens: int = 1
+    parent_target_tokens: int = 80
+    parent_max_tokens: int = 100
+    child_max_tokens: int = 30
+    child_overlap_tokens: int = 5
+    context_budget_tokens: int = 512
+
     # Semantic chunking
     semantic_chunking_enabled: bool = True
     semantic_breakpoint_percentile: float = 90.0
