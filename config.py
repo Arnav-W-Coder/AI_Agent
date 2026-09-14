@@ -42,7 +42,7 @@ class RAGConfig:
     answer_sim_threshold: float = 0.92
     retrieval_sim_threshold: float = 0.97
     answer_cache_schema_version: int = 2
-    retrieval_cache_schema_version: int = 2
+    retrieval_cache_schema_version: int = 3
 
     # Ingestion
     embed_batch_size: int = 16
@@ -64,7 +64,7 @@ class RAGConfig:
     # Web scraping
     max_scrape_urls: int = 5
     ddg_retries: int = 3
-    min_domain_score: int = 65
+    min_domain_score: int = 55
     web_top_k: int = 6
     always_scrape_web: bool = False
     web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
@@ -77,9 +77,10 @@ class RAGConfig:
         "cppreference.com", "cplusplus.com", "learn.microsoft.com",
         "docs.python.org", "developer.mozilla.org", "docs.oracle.com",
         "kernel.org", "llvm.org", "gnu.org", "iso.org", "arxiv.org",
+        "github.com", "huggingface.co", "langchain.com", "ollama.com",
     )
     url_evaluator_enabled: bool = True
-    url_evaluator_min_domain_score: int = 65
+    url_evaluator_min_domain_score: int = 55
     url_evaluator_max_redirects: int = 5
 
     # Critic
@@ -91,7 +92,9 @@ class RAGConfig:
 
     # Rewriter
     rewrite_enabled: bool = True
-    rewrite_only_when_ambiguous: bool = True
+    # Rewrite typo-heavy, multi-constraint, recommendation, and architecture
+    # questions instead of assuming that only ambiguous questions need it.
+    rewrite_only_when_ambiguous: bool = False
     rewriter_helpful_min_score: float = 0.80
     rewriter_unhelpful_max_score: float = 0.40
 
@@ -114,3 +117,12 @@ class RAGConfig:
     # Context expansion
     context_neighbor_count: int = 1
     context_budget_tokens: int = 6000
+
+    # Query routing / confidence
+    query_routing_enabled: bool = True
+    recommendation_query_expansion_enabled: bool = True
+    answerability_min_top_score: float = -2.5
+    answerability_min_mean_score: float = -4.0
+    answerability_min_chunks: int = 2
+    low_confidence_requires_web: bool = True
+    destructive_critic_repair: bool = False
