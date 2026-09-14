@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -40,48 +41,84 @@ def public_host(host: str) -> bool:
     return bool(addresses) and all(ipaddress.ip_address(a).is_global for a in addresses)
 
 
-def evaluate_url(url: str, *, min_domain_score: int = 65) -> dict:
-    """Return a decision before fetching, embedding, or persisting a URL."""
+def _domain_score(host: str, url: str) -> tuple[int, list[str]]:
+    """Score a domain from observable properties, not a site-name allowlist.
+
+    This is a prior, not a claim that a page is true. The fetcher/reranker should
+    still evaluate the actual page title, text quality, and agreement with sources.
+    """
+    labels = [part for part in host.split(".") if part]
+    score = 50
+    reasons: list[str] = []
+    tld = labels[-1] if labels else ""
+    registrable = ".".join(labels[-2:]) if len(labels) >= 2 else host
+    path = urlsplit(url).path.lower()
+
+    if tld in {"gov", "mil"}:
+        score += 28
+        reasons.append("government_tld")
+    elif tld == "edu" or host.endswith(".ac.uk") or host.endswith(".ac.jp"):
+        score += 25
+        reasons.append("academic_tld")
+    elif tld in {"org", "int"}:
+        score += 8
+        reasons.append("organization_tld")
+    elif tld in {"com", "net", "io", "ai", "dev", "co"}:
+        score += 2
+
+    if len(labels) == 2:
+        score += 8
+        reasons.append("direct_registrable_domain")
+    elif len(labels) >= 5:
+        score -= 8
+        reasons.append("deep_subdomain")
+
+    if urlsplit(url).scheme == "https":
+        score += 4
+        reasons.append("https")
+    if any(token in path for token in ("/docs", "/documentation", "/reference", "/api", "/manual", "/papers", "/research")):
+        score += 6
+        reasons.append("documentation_or_research_path")
+    if any(token in host for token in ("blog", "forum", "paste", "wiki")):
+        score -= 6
+        reasons.append("user_generated_or_editorial_subdomain")
+    if re.search(r"(^|[-.])(free|download|torrent|casino|adult)([-.]|$)", host):
+        score -= 25
+        reasons.append("high_risk_host_pattern")
+    if registrable in {"wikipedia.org", "stackoverflow.com"}:
+        score -= 5
+        reasons.append("secondary_reference_source")
+
+    return max(0, min(100, score)), reasons
+
+
+def evaluate_url(url: str, *, min_domain_score: int = 55) -> dict:
+    """Return a decision before fetching, embedding, or persisting a URL.
+
+    Authority is estimated from generic, explainable signals. No vendor or
+    documentation site is permanently trusted by hostname. Page-level quality,
+    retrieval relevance, and cross-source agreement must be checked downstream.
+    """
     normalized = normalize_url(url)
     if not normalized:
         return {
-            "approved": False,
-            "reason": "invalid_or_blocked_url",
-            "url": None,
-            "normalized_url": None,
-            "host": None,
-            "domain_score": 0,
+            "approved": False, "reason": "invalid_or_blocked_url", "url": None,
+            "normalized_url": None, "host": None, "domain_score": 0,
         }
     host = urlsplit(normalized).hostname or ""
     if not public_host(host):
         return {
-            "approved": False,
-            "reason": "non_public_host",
-            "url": normalized,
-            "normalized_url": normalized,
-            "host": host,
-            "domain_score": 0,
+            "approved": False, "reason": "non_public_host", "url": normalized,
+            "normalized_url": normalized, "host": host, "domain_score": 0,
         }
-    labels = host.split(".")
-    score = 92 if labels[-1] in {"gov", "edu"} else 60
-    known = {
-        "cppreference.com": 100, "cplusplus.com": 90,
-        "learn.microsoft.com": 95, "docs.python.org": 100,
-        "developer.mozilla.org": 95, "docs.oracle.com": 95,
-        "kernel.org": 92, "llvm.org": 92, "gnu.org": 92,
-        "iso.org": 92, "arxiv.org": 96, "pubmed.ncbi.nlm.nih.gov": 100,
-        "github.com": 82, "stackoverflow.com": 78,
-        "wikipedia.org": 60,
-    }
-    for i in range(len(labels) - 1):
-        score = known.get(".".join(labels[i:]), score)
-        if score != 60:
-            break
+    score, reasons = _domain_score(host, normalized)
+    approved = score >= min_domain_score
     return {
-        "approved": score >= min_domain_score,
-        "reason": "approved" if score >= min_domain_score else "low_domain_authority",
+        "approved": approved,
+        "reason": "approved" if approved else "low_domain_authority",
         "url": normalized,
         "normalized_url": normalized,
         "host": host,
         "domain_score": score,
+        "domain_score_reasons": reasons,
     }
