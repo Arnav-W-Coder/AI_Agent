@@ -17,61 +17,38 @@ from db import Database
 log = logging.getLogger(__name__)
 MAX_FEW_SHOT = 4
 
-_COLD_PROMPT = ChatPromptTemplate.from_template("""
-You are a search query optimizer for a RAG system.
-Rewrite the user's query to maximise retrieval recall while preserving the
-user's exact intent.
+_STANDALONE_PROMPT = ChatPromptTemplate.from_template("""
+Rewrite the latest user message as one standalone retrieval question.
+Use CHAT HISTORY only to resolve pronouns, ellipsis, and implied subjects.
+Preserve every explicit entity, comparison option, constraint, and requested
+decision criterion from the latest message. Do not add a recommendation,
+assumptions, examples, or a new scope. If it is already standalone, return it
+with only harmless wording cleanup.
 
-Rules:
-- If the query is already clear, make only small retrieval-oriented expansions.
-- Do not change the question being asked, its subject, or its requested scope.
-- Expand acronyms and add closely related synonyms only when useful.
-- Keep the rewritten query under 80 words.
-- Preserve important terminology from the original query.
-- Return ONLY the rewritten query — no preamble, no explanation.
+CHAT HISTORY:
+{history}
 
-Original query: {query}
-Rewritten query:""")
+LATEST USER MESSAGE:
+{query}
 
-_FEW_SHOT_PROMPT = ChatPromptTemplate.from_template("""
-You are a search query optimizer for a RAG system.
-Rewrite the user's query to maximise retrieval recall while preserving the
-user's exact intent.
-
-Here are examples of good rewrites that led to useful answers:
-{examples}
-
-Rules:
-- Follow the style of the examples above without copying their subject matter.
-- If the query is already clear, make only small retrieval-oriented expansions.
-- Do not change the question being asked, its subject, or its requested scope.
-- Expand acronyms and add closely related synonyms only when useful.
-- Keep the rewritten query under 80 words.
-- Preserve important terminology from the original query.
-- Return ONLY the rewritten query — no preamble, no explanation.
-
-Original query: {query}
-Rewritten query:""")
+Return ONLY the standalone question.""")
 
 _EXPANSION_PROMPT = ChatPromptTemplate.from_template("""
-You are expanding a search query for a retrieval-augmented research system.
+You are generating parallel retrieval queries for a research system.
 Return one retrieval query per line and nothing else.
 
 Include:
-- the user's original intent, preserving every named subject and constraint;
-- an intent-focused query;
-- important synonyms and expanded acronyms;
-- comparison dimensions when the query compares options;
-- focused subqueries for major entities or constraints when useful.
+- the standalone question's intent, entities, and constraints;
+- distinct formulations that improve recall, not cosmetic rewrites;
+- comparison dimensions and one focused query per option for comparisons.
 
 Rules:
 - Keep the original meaning and scope. Do not answer the question.
-- Produce 3 to 6 distinct queries for complex, comparative, or recommendation
-    questions; produce 1 to 2 for other questions.
+- Produce 3 to 5 distinct queries.
 - Keep each query under 80 words.
 - Do not use bullets, numbering, labels, or explanations.
 
-Original query: {query}
+Standalone question: {query}
 Retrieval queries:""")
 
 
@@ -81,8 +58,7 @@ class QueryRewriter:
     def __init__(self, db: Database, cfg: RAGConfig, llm: ChatOllama) -> None:
         self.db = db
         self.cfg = cfg
-        self._cold_chain = _COLD_PROMPT | llm | StrOutputParser()
-        self._few_chain = _FEW_SHOT_PROMPT | llm | StrOutputParser()
+        self._standalone_chain = _STANDALONE_PROMPT | llm | StrOutputParser()
         self._expansion_chain = _EXPANSION_PROMPT | llm | StrOutputParser()
 
     @staticmethod
@@ -112,6 +88,14 @@ class QueryRewriter:
         )
 
     @staticmethod
+    def _is_explicit_comparison(query: str) -> bool:
+        text = query.lower().replace("’", "'")
+        return any(marker in text for marker in (
+            "what's better", "what is better", "which is better", " vs ",
+            " versus ", "compare ", "comparison", "differences between",
+        ))
+
+    @staticmethod
     def _parse_queries(original: str, output: str, maximum: int) -> list[str]:
         queries = [original]
         for line in (output or "").splitlines():
@@ -130,8 +114,8 @@ class QueryRewriter:
         rewrite_id, queries = self.rewrite_queries(query)
         return rewrite_id, queries[-1] if len(queries) == 1 else " ".join(queries)
 
-    def rewrite_queries(self, query: str) -> tuple[int, list[str]]:
-        """Return retrieval queries, expanding complex intents when useful."""
+    def rewrite_queries(self, query: str, chat_history: Optional[list[dict | str]] = None) -> tuple[int, list[str]]:
+        """Resolve the question, then generate bounded parallel retrieval queries."""
         original = query.strip()
         if not self.cfg.rewrite_enabled or (
             self.cfg.rewrite_only_when_ambiguous
@@ -147,20 +131,16 @@ class QueryRewriter:
         checkpoint("rewrite.input", original, enabled=self.cfg.debug_checkpoints,
                    preview_chars=self.cfg.checkpoint_preview_chars,
                    sample_items=self.cfg.checkpoint_sample_items)
-        examples = self._fetch_positive_examples()
-        example_block = "\n".join(
-            f"  Original:  {ex['original_query']}\n  Rewritten: {ex['rewritten_query']}"
-            for ex in examples
-        )
-        if self._needs_expansion(original):
-            generated = self._expansion_chain.invoke({"query": original}).strip()
-            queries = self._parse_queries(original, generated, maximum=6)
-        elif examples:
-            rewritten = self._few_chain.invoke({"query": original, "examples": example_block}).strip()
-            queries = self._parse_queries(original, self._sanitize(original, rewritten), maximum=2)
-        else:
-            rewritten = self._cold_chain.invoke({"query": original}).strip()
-            queries = self._parse_queries(original, self._sanitize(original, rewritten), maximum=2)
+        history = "\n".join(
+            item if isinstance(item, str) else f"{item.get('role', 'user')}: {item.get('content', '')}"
+            for item in (chat_history or [])
+        ) or "(No prior conversation.)"
+        standalone = self._sanitize(original, self._standalone_chain.invoke({
+            "query": original, "history": history,
+        }).strip())
+        generated = self._expansion_chain.invoke({"query": standalone}).strip()
+        queries = self._parse_queries(standalone, generated,
+                                     maximum=max(2, int(self.cfg.multi_query_max_queries)))
         rewritten = "\n".join(queries)
         rewrite_id = self._store(original, rewritten)
         checkpoint("rewrite.output", {"original": original, "rewritten": rewritten, "queries": queries},

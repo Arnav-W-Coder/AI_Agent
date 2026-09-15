@@ -81,7 +81,7 @@ def print_result(result: dict) -> None:
         print("No sources returned.")
     else:
         for i, source in enumerate(sources, start=1):
-            filename = source.get("filename", "unknown")
+            filename = source.get("url") or source.get("filename", "unknown")
             page = source.get("page", 0)
             score = source.get("rerank_score", 0.0)
             print(f"{i}. {filename} | page {page} | rerank={score}")

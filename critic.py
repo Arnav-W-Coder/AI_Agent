@@ -79,7 +79,8 @@ Rules:
 - Preserve supported, useful information whenever possible.
 - Remove unsupported factual claims or rewrite them so they are fully supported.
 - Address missing parts only when the context supports them.
-- Do not add outside knowledge, examples, numbers, citations, or terminology.
+- Cite factual claims using only the existing [Source N] markers in the context.
+- Do not add outside knowledge, examples, numbers, unsupported citations, or terminology.
 - If the context cannot support a requested point, say so briefly rather than inventing it.
 - Return ONLY the corrected answer.
 - Never mention the critic, repair, flagged claims, grounding, context quality,
@@ -94,8 +95,9 @@ Regenerate an answer after a hallucination was detected. Use ONLY the
 retrieved context and the original question.
 
 You may completely restructure the previous answer, but every factual
-statement must be directly supported by the context. Do not use outside
-knowledge or preserve unsupported claims. If the context is insufficient,
+statement must be directly supported by the context and cite its matching
+[Source N] marker. Do not use outside knowledge or preserve unsupported
+claims. If the context is insufficient,
 return exactly: I don't have enough information to answer this confidently.
 
 Original question: {question}
@@ -148,7 +150,12 @@ class CriticAndRepair:
         if not context or not context.strip():
             return self._result("HALLUCINATED", "major", "No retrieval context was provided.", False)
         if self._is_uncertainty_response(answer):
-            return self._result("PASS", "none", "", True)
+            # A refusal is not a successful answer. It must not receive a PASS
+            # verdict or be treated as a cacheable, validated response.
+            self.last_details = {"groundedness": "UNCERTAIN", "completeness": "FAIL", "relevance": "UNCERTAIN"}
+            return {"verdict": "UNCERTAIN", "severity": "none", "unsupported_claims": [],
+                    "repairable": False, "critique": "The answer is an uncertainty/refusal response.",
+                    "repaired_answer": None}
         try:
             raw = self._critic_chain.invoke({
                 "question": question or "Determine whether the answer is supported by the retrieved context.",

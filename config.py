@@ -41,14 +41,13 @@ class RAGConfig:
     retrieval_ttl: int = 1800
     answer_sim_threshold: float = 0.92
     retrieval_sim_threshold: float = 0.97
-    answer_cache_schema_version: int = 2
-    retrieval_cache_schema_version: int = 3
+    answer_cache_schema_version: int = 3
+    retrieval_cache_schema_version: int = 4
 
     # Ingestion
     embed_batch_size: int = 16
     ingest_workers: int = 4
     web_embed_batch_size: int = 32
-    context_neighbor_count: int = 1
 
     # Monitoring / drift
     drift_window: int = 50
@@ -65,7 +64,7 @@ class RAGConfig:
     max_scrape_urls: int = 5
     ddg_retries: int = 3
     min_domain_score: int = 55
-    web_top_k: int = 6
+    web_top_k: int = 10
     always_scrape_web: bool = False
     web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
     web_chunk_ttl_hours: int = 24
@@ -73,6 +72,8 @@ class RAGConfig:
     web_fetch_workers: int = 4
     web_request_timeout_seconds: int = 12
     web_min_text_chars: int = 400
+    web_min_page_quality: float = 0.45
+    web_min_query_relevance: float = 0.20
     web_authoritative_domains: tuple[str, ...] = (
         "cppreference.com", "cplusplus.com", "learn.microsoft.com",
         "docs.python.org", "developer.mozilla.org", "docs.oracle.com",
@@ -97,6 +98,7 @@ class RAGConfig:
 
     # Rewriter
     rewrite_enabled: bool = True
+    multi_query_max_queries: int = 5
     # Rewrite typo-heavy, multi-constraint, recommendation, and architecture
     # questions instead of assuming that only ambiguous questions need it.
     rewrite_only_when_ambiguous: bool = False
@@ -107,38 +109,27 @@ class RAGConfig:
     chunk_size: int = 500
     chunk_overlap: int = 75
 
-    # Semantic chunking / context expansion
-    semantic_chunking_enabled: bool = True
-    semantic_breakpoint_percentile: float = 75.0
-    semantic_min_distance: float = 0.10
-    semantic_min_block_tokens: int = 1
-    parent_target_tokens: int = 80
-    parent_max_tokens: int = 100
-    child_max_tokens: int = 30
-    child_overlap_tokens: int = 5
-    context_budget_tokens: int = 512
-
-    # Semantic chunking
+    # Semantic and hierarchical chunking
     semantic_chunking_enabled: bool = True
     semantic_breakpoint_percentile: float = 90.0
     semantic_min_distance: float = 0.0
     semantic_min_block_tokens: int = 80
 
-    # Hierarchical chunking
     parent_target_tokens: int = 600
     parent_max_tokens: int = 900
     child_max_tokens: int = 220
     child_overlap_tokens: int = 40
 
-    # Context expansion
     context_neighbor_count: int = 1
     context_budget_tokens: int = 6000
 
     # Query routing / confidence
     query_routing_enabled: bool = True
     recommendation_query_expansion_enabled: bool = True
-    answerability_min_top_score: float = -2.5
-    answerability_min_mean_score: float = -4.0
+    answerability_min_top_score: float = 0.0
+    answerability_min_mean_score: float = -0.5
     answerability_min_chunks: int = 2
+    answerability_min_query_term_coverage: float = 0.70
+    comparison_require_all_options: bool = True
     low_confidence_requires_web: bool = True
     destructive_critic_repair: bool = False

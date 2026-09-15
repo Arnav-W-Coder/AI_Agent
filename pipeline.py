@@ -43,6 +43,8 @@ Requirements:
 - Use concise headings or lists when useful.
 - Explain relationships only when the context supports them.
 - Every factual claim must be supported by the context.
+- Cite every factual claim with one or more matching [Source N] markers from
+  the context. Do not cite a source that does not support the claim.
 - Do not invent facts, examples, numbers, citations, or terminology.
 - If the context genuinely lacks enough information, say exactly:
   I don't have enough information to answer this confidently.
@@ -135,13 +137,14 @@ class ProductionRAGPipeline:
     @staticmethod
     def _classify_query(question: str) -> str:
         """Classify query intent using inexpensive lexical signals."""
-        text = question.strip().lower()
+        text = question.strip().lower().replace("’", "'")
         words = set(re.findall(r"[a-z0-9_]+", text))
         if any(marker in text for marker in ("stack trace", "traceback", "error:",
                                               "exception", "not working", "fails", "failure")):
             return "troubleshooting"
         if any(marker in text for marker in ("compare ", "comparison", " versus ", " vs ",
-                                              "differences between", "which is better")):
+                                              "differences between", "which is better", "what's better",
+                                              "what is better")):
             return "comparison"
         if any(word in words for word in ("best", "recommend", "recommendation", "alternatives")):
             return "recommendation"
@@ -164,14 +167,19 @@ class ProductionRAGPipeline:
     @staticmethod
     def _named_options(question: str) -> list[str]:
         """Extract simple comma/and-separated options from comparison queries."""
-        subject = re.split(r"\bfor\b", question, maxsplit=1, flags=re.IGNORECASE)[0]
+        subject = re.split(r"\bfor\b", question.replace("’", "'"), maxsplit=1, flags=re.IGNORECASE)[0]
+        # Handles natural comparisons such as "What's better, X or Y?".
+        better_match = re.search(r"\b(?:what(?:'s| is)|which is)\s+better\s*,?\s*(.+)$",
+                                 subject, flags=re.IGNORECASE)
+        if better_match:
+            subject = better_match.group(1)
         subject = re.sub(r"^.*?\b(?:compare|comparison of|differences between)\b", "", subject,
                          flags=re.IGNORECASE)
-        parts = re.split(r",|\band\b|\bvs\.?\b|\bversus\b", subject, flags=re.IGNORECASE)
+        parts = re.split(r",|\band\b|\bor\b|\bvs\.?\b|\bversus\b", subject, flags=re.IGNORECASE)
         options = []
         for part in parts:
             value = re.sub(r"[^A-Za-z0-9+#. -]", "", part).strip(" -")
-            if 2 <= len(value.split()) <= 5 and value.lower() not in {"what", "which"}:
+            if 1 <= len(value.split()) <= 5 and value.lower() not in {"what", "which", "better"}:
                 options.append(value)
         return list(dict.fromkeys(options))
 
@@ -218,15 +226,22 @@ class ProductionRAGPipeline:
         elif query_type == "how_to":
             plan["queries"] = [f"{query} documentation reference guide" for query in plan["queries"]]
         elif query_type == "comparison":
-            plan["queries"].extend(f"{option} {question}" for option in self._named_options(question))
+            options = self._named_options(question)
+            if len(options) >= 2:
+                plan["queries"].extend([
+                    f"{options[0]} vs {options[1]} comparison differences tradeoffs",
+                    *(f"{option} architecture benefits limitations" for option in options),
+                ])
+            plan["always_web"] = True
             plan["diversify"] = True
-            plan["candidate_k"] = max(self.cfg.top_k_rerank * 2, self.cfg.top_k_rerank + 2)
+            plan["candidate_k"] = max(self.cfg.top_k_rerank * 4, self.cfg.top_k_rerank + 6)
         elif query_type == "recommendation":
             if self.cfg.recommendation_query_expansion_enabled:
                 plan["queries"] = self._recommendation_queries(question, plan["queries"])
             else:
                 plan["queries"] = [question]
             plan["diversify"] = True
+            plan["always_web"] = True
             plan["candidate_k"] = max(self.cfg.top_k_rerank * 2, self.cfg.top_k_rerank + 2)
         elif query_type == "troubleshooting":
             plan["queries"].append(f"{question} exact error message solution")
@@ -282,7 +297,42 @@ class ProductionRAGPipeline:
 
         return selected
 
-    def _is_answerable(self, chunks: list[dict]) -> bool:
+    def _preserve_comparison_coverage(self, chunks: list[dict], question: str,
+                                      limit: int) -> list[dict]:
+        """Keep the best evidence for every comparison option before truncating."""
+        options = self._named_options(question)
+        if len(options) < 2:
+            return chunks[:limit]
+        ranked = sorted(chunks, key=lambda chunk: chunk.get("rerank_score", 0.0), reverse=True)
+        selected: list[dict] = []
+        selected_ids: set[str] = set()
+        for option in options:
+            match = next(
+                (chunk for chunk in ranked
+                 if option.lower() in f"{chunk.get('title', '')} {chunk.get('text', '')}".lower()),
+                None,
+            )
+            if match:
+                identifier = match.get("chroma_id") or str(id(match))
+                if identifier not in selected_ids:
+                    selected.append(match)
+                    selected_ids.add(identifier)
+        for chunk in ranked:
+            identifier = chunk.get("chroma_id") or str(id(chunk))
+            if identifier not in selected_ids and len(selected) < limit:
+                selected.append(chunk)
+                selected_ids.add(identifier)
+        return selected[:limit]
+
+    @staticmethod
+    def _evidence_terms(question: str) -> set[str]:
+        stop_words = {"what", "which", "whats", "is", "are", "the", "a", "an", "and", "or",
+                      "for", "to", "of", "in", "on", "better", "best", "compare", "comparison"}
+        return {term for term in re.findall(r"[a-z0-9+#.]+", question.lower())
+                if len(term) > 2 and term not in stop_words}
+
+    def _is_answerable(self, chunks: list[dict], question: str = "",
+                       query_type: str = "") -> bool:
         scores = [
             float(chunk.get("rerank_score", 0.0))
             for chunk in chunks
@@ -290,14 +340,86 @@ class ProductionRAGPipeline:
         ]
         if len(chunks) < self.cfg.answerability_min_chunks or not scores:
             return False
-        return (
+        scores_ok = (
             max(scores) >= self.cfg.answerability_min_top_score
             and sum(scores) / len(scores) >= self.cfg.answerability_min_mean_score
         )
+        if not scores_ok or not question:
+            return scores_ok
+        evidence = " ".join(chunk.get("text", chunk.get("text_preview", "")).lower()
+                             for chunk in chunks)
+        terms = self._evidence_terms(question)
+        coverage = sum(term in evidence for term in terms) / len(terms) if terms else 1.0
+        if coverage < self.cfg.answerability_min_query_term_coverage:
+            return False
+        if query_type == "comparison" and self.cfg.comparison_require_all_options:
+            options = self._named_options(question)
+            return bool(options) and all(option.lower() in evidence for option in options)
+        return True
+
+    @staticmethod
+    def _is_refusal(answer: str) -> bool:
+        return "i don't have enough information" in answer.lower()
+
+    @staticmethod
+    def _has_valid_citations(answer: str, source_count: int) -> bool:
+        citations = [int(value) for value in re.findall(r"\[Source\s+(\d+)\]", answer, re.IGNORECASE)]
+        return bool(citations) and all(1 <= value <= source_count for value in citations)
+
+    def _retrieval_cache_key(self, rewritten_query: str) -> str:
+        """Bind retrieval cache entries to the current indexed document/chunk state."""
+        documents = self.cache.all_document_metadata()
+        state = repr(sorted(
+            (doc_id, item.get("filename"), item.get("chunk_count"), item.get("metadata"))
+            for doc_id, item in documents.items()
+        ))
+        fingerprint = hashlib.sha256(state.encode("utf-8")).hexdigest()
+        return (f"query={rewritten_query}\nindex={fingerprint}\n"
+                f"schema={self.cfg.retrieval_cache_schema_version}\n"
+                f"semantic={self.cfg.semantic_chunking_enabled}:{self.cfg.semantic_breakpoint_percentile}:"
+                f"{self.cfg.parent_target_tokens}:{self.cfg.child_max_tokens}")
 
     @staticmethod
     def _insufficient_information_response(question: str) -> str:
         return "I don't have enough information to answer this confidently."
+
+    @staticmethod
+    def _print_query_trace(question: str, query_type: str, retrieval_queries: list[str],
+                           chunks: list[dict], answer: str, critic_metadata: dict,
+                           metrics: dict, cache_status: str) -> None:
+        print("\n" + "=" * 88)
+        print("[ARCHITECTURE TRACE] Final query handoff")
+        print("=" * 88)
+        print("[1 INPUT] question:", question)
+        print("[2 ROUTE] type=%s | retrieval_queries=%d" % (query_type, len(retrieval_queries)))
+        for index, query in enumerate(retrieval_queries, 1):
+            print("    query[%d]: %s" % (index, query))
+        print("[3 RETRIEVAL] cache=%s | chunks=%d | web_scrape_used=%s" % (
+            cache_status, len(chunks), metrics.get("web_scrape_used", False)))
+        print("[4 RERANK] top=%.4f | mean=%.4f | answerable=%s | low_confidence=%s" % (
+            metrics.get("top_rerank_score", 0.0), metrics.get("mean_rerank_score", 0.0),
+            metrics.get("answerable", False), metrics.get("low_confidence", False)))
+        print("[5 CRITIC] verdict=%s | severity=%s | repair_mode=%s | attempts=%s | validated=%s" % (
+            critic_metadata.get("verdict"), critic_metadata.get("severity"),
+            critic_metadata.get("repair_mode"), critic_metadata.get("repair_attempts"),
+            critic_metadata.get("validated")))
+        print("[6 CACHE] answer_cache=%s" % ("stored" if critic_metadata.get("validated") else "skipped"))
+        print("[7 OUTPUT] answer: %s" % answer)
+        print("[8 SOURCES] count=%d" % len(chunks))
+        for index, chunk in enumerate(chunks, 1):
+            source = chunk.get("source_url") or chunk.get("filename") or "unknown"
+            print(
+                "    source[%d]: type=%s | url=%s | retrieval=%.4f | rerank=%.4f | "
+                "domain=%.2f | page_quality=%.4f | title=%s" % (
+                    index, chunk.get("source_type", "pdf"), source,
+                    float(chunk.get("retrieval_score", chunk.get("dense_score", 0.0)) or 0.0),
+                    float(chunk.get("rerank_score", 0.0) or 0.0),
+                    float(chunk.get("domain_score", 0.0) or 0.0),
+                    float(chunk.get("page_quality_score", 0.0) or 0.0),
+                    chunk.get("title", ""),
+                )
+            )
+        print("=" * 88 + "\n")
 
     def _repair_answer(self, question: str, answer: str, critic_result: dict,
                        context: str) -> tuple[str | None, str]:
@@ -377,11 +499,9 @@ class ProductionRAGPipeline:
         web_winners = [chunk for chunk in reranked
                        if chunk.get("source_type") == "web" or not chunk.get("parent_id")]
         expanded_pdf = self.retriever.expand_to_context(pdf_winners)
-        recovered = sorted(
-            expanded_pdf + web_winners,
-            key=lambda chunk: chunk.get("rerank_score", 0.0),
-            reverse=True,
-        )
+        recovered = expanded_pdf + web_winners
+        if query_type == "comparison":
+            return self._preserve_comparison_coverage(recovered, question, limit)
         return self._diversify_sources(recovered, query_type, limit)
 
     def __init__(self, cfg: RAGConfig) -> None:
@@ -434,8 +554,10 @@ class ProductionRAGPipeline:
         trace.rewritten_query = rewritten
         answer_cache_key = (
             f"question={question}\nrewritten_query={rewritten}\n"
+            f"answer_cache_schema_version={self.cfg.answer_cache_schema_version}\n"
             f"retrieval_cache_schema_version={self.cfg.retrieval_cache_schema_version}\n"
-            f"critic_config_version={self.cfg.critic_config_version}"
+            f"critic_config_version={self.cfg.critic_config_version}\n"
+            f"index_state={self._retrieval_cache_key(rewritten)}"
         )
         cached = self.cache.get_answer(
             question, query_emb, cache_key=answer_cache_key, include_metadata=True
@@ -445,12 +567,21 @@ class ProductionRAGPipeline:
             trace.answer_cache_hit = True
             trace.t_end = time.time()
             self.metrics.record(trace)
+            cached_metrics = {"answer_cache_hit": True, "total_ms": trace.total_ms(),
+                              "web_scrape_used": False, "answerable": True,
+                              "low_confidence": False, "top_rerank_score": 0.0,
+                              "mean_rerank_score": 0.0}
+            self._print_query_trace(
+                question, query_type, retrieval_queries, sources, answer,
+                critic_metadata, cached_metrics, "hit",
+            )
             return {"answer": answer, "sources": sources, "critic": critic_metadata,
                     "query_id": trace.query_id, "rewrite_id": rewrite_id,
                     "rewritten_query": rewritten, "from_cache": True,
                     "drift_alert": None,
-                    "metrics": {"answer_cache_hit": True, "total_ms": trace.total_ms()}}
-        cached_chunks = self.cache.get_retrieval(rewritten)
+                    "metrics": cached_metrics}
+        retrieval_cache_key = self._retrieval_cache_key(rewritten)
+        cached_chunks = self.cache.get_retrieval(retrieval_cache_key)
         bm25_ids: set = set()
         dense_ids: set = set()
         web_scrape_used = False
@@ -507,12 +638,18 @@ class ProductionRAGPipeline:
             pdf_winners = [c for c in chunks if c.get("source_type") != "web" and c.get("parent_id")]
             web_winners = [c for c in chunks if c.get("source_type") == "web" or not c.get("parent_id")]
             expanded_pdf = self.retriever.expand_to_context(pdf_winners)
-            chunks = sorted(expanded_pdf + web_winners,
-                            key=lambda c: c.get("rerank_score", 0.0), reverse=True)
-            chunks = self._diversify_sources(chunks, query_type, retrieval_plan["top_k"])
+            expanded_candidates = expanded_pdf + web_winners
+            if query_type == "comparison":
+                chunks = self._preserve_comparison_coverage(
+                    expanded_candidates, question, retrieval_plan["top_k"]
+                )
+            else:
+                chunks = self._diversify_sources(
+                    expanded_candidates, query_type, retrieval_plan["top_k"]
+                )
             trace.t_rerank = time.time()
 
-            if use_web_fallback and not retrieval_plan["always_web"] and not self._is_answerable(chunks):
+            if use_web_fallback and not retrieval_plan["always_web"] and not self._is_answerable(chunks, question, query_type):
                 log.info("[Query] Local sources failed answerability; using web fallback")
                 chunks = self._broader_web_retrieval(
                     question,
@@ -527,8 +664,8 @@ class ProductionRAGPipeline:
 
             safe_chunks = [{k: v for k, v in c.items()
                             if isinstance(v, (str, int, float, bool, type(None), list))} for c in chunks]
-            if self._is_answerable(chunks):
-                self.cache.set_retrieval(rewritten, safe_chunks)
+            if self._is_answerable(chunks, question, query_type):
+                self.cache.set_retrieval(retrieval_cache_key, safe_chunks)
             else:
                 log.info("[Cache] Skipping weak retrieval result")
 
@@ -538,7 +675,7 @@ class ProductionRAGPipeline:
         trace.top_rerank_score = max(scores) if scores else 0.0
         trace.bm25_overlap = len(bm25_ids & dense_ids)
 
-        answerable = self._is_answerable(chunks)
+        answerable = self._is_answerable(chunks, question, query_type)
         low_confidence = (
             trace.top_rerank_score < self.cfg.answerability_min_top_score
             or trace.mean_rerank_score < self.cfg.answerability_min_mean_score
@@ -557,14 +694,17 @@ class ProductionRAGPipeline:
             )
             trace.t_retrieval = time.time()
             scores = [c.get("rerank_score", 0.0) for c in chunks if "rerank_score" in c]
-            answerable = self._is_answerable(chunks)
+            answerable = self._is_answerable(chunks, question, query_type)
             trace.num_chunks_retrieved = len(chunks)
             trace.mean_rerank_score = round(sum(scores) / len(scores), 4) if scores else 0.0
             trace.top_rerank_score = max(scores) if scores else 0.0
             trace.t_rerank = time.time()
             web_scrape_used = True
 
-        context = self._format_context(chunks)
+        # Neighbor chunks are context expansion aids, not retrieval hits. Do not
+        # present their zero scores as independently selected citations.
+        citation_chunks = [chunk for chunk in chunks if chunk.get("chunk_type") != "neighbor_context"]
+        context = self._format_context(citation_chunks)
         if answerable:
             log.info("[Query] Generating answer over %d chunks...", len(chunks))
             answer = self._rag_chain.invoke({"context": context, "question": question}).strip()
@@ -580,7 +720,10 @@ class ProductionRAGPipeline:
         }
         repair_mode = "critic_disabled"
         repair_attempts = 0
-        if self.cfg.critic_enabled:
+        should_run_critic = self.cfg.critic_enabled and (
+            not self.cfg.critic_on_low_confidence_only or low_confidence
+        )
+        if should_run_critic:
             critic_result = self.critic.evaluate(question, answer, context)
             repair_mode = "none"
             max_attempts = max(0, int(self.cfg.critic_max_repair_attempts))
@@ -607,11 +750,15 @@ class ProductionRAGPipeline:
             log.info("[Query] Critic verdict=%s severity=%s repair_mode=%s",
                      critic_result["verdict"], critic_result.get("severity"), repair_mode)
 
-        critic_details = dict(self.critic.last_details)
-        faith_score = 1.0 if critic_result["verdict"] == "PASS" else 0.0
+        critic_details = dict(self.critic.last_details) if should_run_critic else {}
+        citations_valid = self._has_valid_citations(answer, len(citation_chunks))
+        refusal = self._is_refusal(answer)
+        faith_score = 1.0 if critic_result["verdict"] == "PASS" and citations_valid and not refusal else 0.0
         if self.cfg.critic_enabled and self.cfg.critic_polish_enabled:
             answer = self.critic.polish(answer)
-        validated = self.cfg.critic_enabled and critic_result["verdict"] == "PASS"
+        validated = answerable and citations_valid and not refusal and (
+            not should_run_critic or critic_result["verdict"] == "PASS"
+        )
         critic_metadata = {
             "initial_answer": generated_answer,
             "final_answer": answer,
@@ -623,7 +770,7 @@ class ProductionRAGPipeline:
         }
         trace.answer_faithfulness = faith_score
 
-        sources = [self._source_provenance(c, i) for i, c in enumerate(chunks, 1)]
+        sources = [self._source_provenance(c, i) for i, c in enumerate(citation_chunks, 1)]
         if validated:
             self.cache.set_answer(
                 question,
@@ -646,29 +793,35 @@ class ProductionRAGPipeline:
         self._query_count += 1
         drift_alert = self.metrics.check_drift() if self._query_count % self.cfg.drift_window == 0 else None
         log.info("[Query] Done in %.0fms", trace.total_ms())
+        result_metrics = {
+            "total_ms": trace.total_ms(),
+            "rewrite_ms": trace.latency_ms(trace.t_start, trace.t_rewrite),
+            "retrieval_ms": trace.latency_ms(trace.t_rewrite, trace.t_retrieval),
+            "generation_ms": trace.latency_ms(trace.t_rerank, trace.t_generation),
+            "top_rerank_score": trace.top_rerank_score,
+            "mean_rerank_score": trace.mean_rerank_score,
+            "faithfulness": faith_score,
+            "critic_groundedness": critic_details.get("groundedness", "UNKNOWN"),
+            "critic_completeness": critic_details.get("completeness", "UNKNOWN"),
+            "critic_relevance": critic_details.get("relevance", "UNKNOWN"),
+            "chunks_used": len(chunks), "bm25_overlap": trace.bm25_overlap,
+            "retrieval_cached": trace.retrieval_cache_hit,
+            "query_type": query_type,
+            "answerable": answerable,
+            "low_confidence": low_confidence,
+            "web_scrape_used": web_scrape_used,
+        }
+        self._print_query_trace(
+            question, query_type, retrieval_queries, citation_chunks, answer,
+            critic_metadata, result_metrics,
+            "hit" if trace.retrieval_cache_hit else "miss",
+        )
         return {
             "answer": answer, "sources": sources, "critic": critic_metadata,
             "query_id": trace.query_id,
             "rewrite_id": rewrite_id, "rewritten_query": rewritten, "from_cache": False,
             "drift_alert": drift_alert,
-            "metrics": {
-                "total_ms": trace.total_ms(),
-                "rewrite_ms": trace.latency_ms(trace.t_start, trace.t_rewrite),
-                "retrieval_ms": trace.latency_ms(trace.t_rewrite, trace.t_retrieval),
-                "generation_ms": trace.latency_ms(trace.t_rerank, trace.t_generation),
-                "top_rerank_score": trace.top_rerank_score,
-                "mean_rerank_score": trace.mean_rerank_score,
-                "faithfulness": faith_score,
-                "critic_groundedness": critic_details.get("groundedness", "UNKNOWN"),
-                "critic_completeness": critic_details.get("completeness", "UNKNOWN"),
-                "critic_relevance": critic_details.get("relevance", "UNKNOWN"),
-                "chunks_used": len(chunks), "bm25_overlap": trace.bm25_overlap,
-                "retrieval_cached": trace.retrieval_cache_hit,
-                "query_type": query_type,
-                "answerable": answerable,
-                "low_confidence": low_confidence,
-                "web_scrape_used": web_scrape_used,
-            },
+            "metrics": result_metrics,
         }
 
     def rate_answer(self, query_id: str, rating: int, rewrite_id: Optional[int] = None) -> None:
@@ -862,6 +1015,18 @@ class ProductionRAGPipeline:
                 log.info("[WebScrape] Skipping duplicate page content: %s", canonical_url)
                 continue
             seen_content.add(content_hash)
+            print(
+                "[WEB PAGE] url=%s | final_url=%s | status=%s | redirects=%s | "
+                "paragraphs=%s | query_relevance=%.4f | page_quality=%.4f" % (
+                    result.get("href", canonical_url),
+                    page_metadata.get("final_url", canonical_url),
+                    page_metadata.get("http_status", "?"),
+                    page_metadata.get("redirect_count", "?"),
+                    page_metadata.get("meaningful_paragraphs", 0),
+                    page_metadata.get("query_relevance", 0.0),
+                    page_metadata.get("page_quality_score", 0.0),
+                )
+            )
 
             if self.web_store.is_fresh(canonical_url):
                 continue
@@ -922,7 +1087,7 @@ class ProductionRAGPipeline:
                     resp = session.get(
                         current_url,
                         headers={"User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)"},
-                        timeout=10,
+                        timeout=self.cfg.web_request_timeout_seconds,
                         allow_redirects=False,
                     )
                     if 300 <= resp.status_code < 400:
@@ -980,7 +1145,7 @@ class ProductionRAGPipeline:
                     main = soup.find("main") or soup.find("article") or soup.body
                     text = main.get_text(separator="\n", strip=True) if main else ""
                     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-                    if len(text) < 120:
+                    if len(text) < self.cfg.web_min_text_chars:
                         log.info("[WebScrape] Rejected low-content page: %s", final_url)
                         return None
                     title_tag = soup.find("title")

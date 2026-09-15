@@ -50,6 +50,13 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 cover/
+pytest-output.txt
+
+# Local RAG indexes and runtime cache state
+rag.db
+rag.db-*
+chroma_db/
+chroma_web/
 
 # Translations
 *.mo

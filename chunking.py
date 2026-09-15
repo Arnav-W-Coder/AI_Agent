@@ -38,6 +38,10 @@ class HierarchicalChunker:
     def __init__(self, cfg, embedding_fn: Callable[[list[str]], list[list[float]]]):
         self.cfg = cfg
         self.embedding_fn = embedding_fn
+        # Keep the chunker usable with a minimal config in library/tests.
+        self._debug_checkpoints = getattr(cfg, "debug_checkpoints", False)
+        self._checkpoint_preview_chars = getattr(cfg, "checkpoint_preview_chars", 160)
+        self._checkpoint_sample_items = getattr(cfg, "checkpoint_sample_items", 3)
         try:
             self.encoder = tiktoken.get_encoding("cl100k_base")
         except Exception:
@@ -133,8 +137,8 @@ class HierarchicalChunker:
                 blocks.append("\n\n".join(current)); current = []
         if current:
             blocks.append("\n\n".join(current))
-        checkpoint("chunking.semantic_blocks", blocks, enabled=self.cfg.debug_checkpoints,
-                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+        checkpoint("chunking.semantic_blocks", blocks, enabled=self._debug_checkpoints,
+                   preview_chars=self._checkpoint_preview_chars, sample_items=self._checkpoint_sample_items,
                    paragraphs=len(paragraphs), blocks=len(blocks), threshold=threshold)
         return blocks
 
@@ -184,12 +188,12 @@ class HierarchicalChunker:
         return out
 
     def chunk(self, pages: Sequence[Document], doc_id: str) -> tuple[list[ChunkRecord], list[ChunkRecord]]:
-        checkpoint("chunking.input", pages, enabled=self.cfg.debug_checkpoints,
-                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+        checkpoint("chunking.input", pages, enabled=self._debug_checkpoints,
+                   preview_chars=self._checkpoint_preview_chars, sample_items=self._checkpoint_sample_items,
                    doc_id=doc_id, pages=len(pages))
         sections = self._structure_sections(pages)
-        checkpoint("chunking.structure_sections", sections, enabled=self.cfg.debug_checkpoints,
-                   preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
+        checkpoint("chunking.structure_sections", sections, enabled=self._debug_checkpoints,
+                   preview_chars=self._checkpoint_preview_chars, sample_items=self._checkpoint_sample_items,
                    section_count=len(sections))
         parents, children = [], []
         parent_index = child_index = 0
@@ -206,7 +210,7 @@ class HierarchicalChunker:
                     child_index += 1
                 parent_index += 1
         checkpoint("chunking.output", {"parents": parents, "children": children},
-                   enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
-                   sample_items=self.cfg.checkpoint_sample_items,
+                   enabled=self._debug_checkpoints, preview_chars=self._checkpoint_preview_chars,
+                   sample_items=self._checkpoint_sample_items,
                    parent_count=len(parents), child_count=len(children))
         return parents, children
