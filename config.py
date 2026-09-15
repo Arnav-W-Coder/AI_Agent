@@ -92,15 +92,13 @@ class RAGConfig:
     critic_polish_enabled: bool = False
     constrained_critic_repair: bool = True
     critic_max_repair_attempts: int = 1
-    critic_abstain_on_failed_repair: bool = True
+    critic_abstain_on_failed_repair: bool = False
     critic_require_context_grounding: bool = True
-    critic_config_version: int = 2
+    critic_config_version: int = 3
 
     # Rewriter
     rewrite_enabled: bool = True
     multi_query_max_queries: int = 5
-    # Rewrite typo-heavy, multi-constraint, recommendation, and architecture
-    # questions instead of assuming that only ambiguous questions need it.
     rewrite_only_when_ambiguous: bool = False
     rewriter_helpful_min_score: float = 0.80
     rewriter_unhelpful_max_score: float = 0.40
