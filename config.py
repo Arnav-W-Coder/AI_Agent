@@ -8,83 +8,126 @@ from pathlib import Path
 
 @dataclass
 class RAGConfig:
+    # Models
+    embed_model: str = "nomic-embed-text"
+    llm_model: str = "llama3.2"
+    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    critic_model: str | None = None
+    rewriter_model: str | None = None
 
-    # ── Models ────────────────────────────────────────────────────────────────
-    embed_model:  str = "nomic-embed-text"          # Ollama embedding model
-    llm_model:    str = "llama3.2"                  # Ollama generation model
-    rerank_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"  # HF cross-encoder
-
-    # ── Paths ─────────────────────────────────────────────────────────────────
-    docs_dir:   Path = field(default_factory=lambda: Path("./docs"))
+    # Paths
+    docs_dir: Path = field(default_factory=lambda: Path("./docs"))
     chroma_dir: Path = field(default_factory=lambda: Path("./chroma_db"))
-    db_path:    Path = field(default_factory=lambda: Path("./rag.db"))
+    db_path: Path = field(default_factory=lambda: Path("./rag.db"))
 
-    # ── LLM ───────────────────────────────────────────────────────────────────
+    # LLM
     ctx_window: int = 16384
+    max_answer_chars: int = 5000
 
-    # ── Chunking ──────────────────────────────────────────────────────────────
-    chunk_size:    int = 800
-    chunk_overlap: int = 150
+    # Retrieval
+    top_k_dense: int = 30
+    top_k_sparse: int = 30
+    top_k_rerank: int = 15
+    rrf_k: int = 60
+    min_rerank_score: float = -8.0
+    min_mean_rerank_score: float = 0.0
+    min_top_rerank_score: float = 0.0
+    retrieval_quality_margin: float = 0.0
+    low_confidence_pdf_limit: int = 5
+    require_retrieval_evidence: bool = True
 
-    # ── Retrieval ─────────────────────────────────────────────────────────────
-    top_k_dense:      int   = 20    # dense ANN candidates before rerank
-    top_k_sparse:     int   = 20    # BM25 candidates before rerank
-    top_k_rerank:     int   = 5     # final chunks after cross-encoder rerank
-    rrf_k:            int   = 60    # RRF constant (60 is the standard)
-    min_rerank_score: float = -8.0  # drop chunks scoring below this
+    # Caching
+    answer_ttl: int = 3600
+    retrieval_ttl: int = 1800
+    answer_sim_threshold: float = 0.92
+    retrieval_sim_threshold: float = 0.97
+    answer_cache_schema_version: int = 3
+    retrieval_cache_schema_version: int = 4
 
-    # ── Caching ───────────────────────────────────────────────────────────────
-    answer_ttl:              int   = 3600   # seconds before answer cache expires
-    retrieval_ttl:           int   = 1800   # seconds before retrieval cache expires
-    answer_sim_threshold:    float = 0.92   # cosine sim for semantic answer cache hit
-    retrieval_sim_threshold: float = 0.97   # cosine sim for retrieval cache hit
+    # Ingestion
+    embed_batch_size: int = 16
+    ingest_workers: int = 4
+    web_embed_batch_size: int = 32
 
-    # ── Ingestion ─────────────────────────────────────────────────────────────
-    embed_batch_size: int = 16   # chunks per embedding API call
-    ingest_workers:   int = 4    # parallel PDF loaders
+    # Monitoring / drift
+    drift_window: int = 50
+    drift_threshold: float = 0.12
+    min_retrieval_score: float = 0.20
+    latency_warn_ms: int = 6000
 
-    # ── Monitoring / drift ────────────────────────────────────────────────────
-    drift_window:        int   = 50    # queries per drift-check window
-    drift_threshold:     float = 0.12  # fractional drop in mean score → re-embed
-    min_retrieval_score: float = 0.20  # below this flags poor retrieval in logs
-    latency_warn_ms:     int   = 6000  # log warning if total latency > this
+    # Debug / checkpoints
+    debug_checkpoints: bool = True
+    checkpoint_preview_chars: int = 160
+    checkpoint_sample_items: int = 3
 
-    # ── Web scraping ──────────────────────────────────────────────────────────
-    max_scrape_urls:   int  = 5
-    ddg_retries:       int  = 3
-    min_domain_score:  int  = 30
-    web_top_k:         int  = 6     # chunks returned from web store per query
-    always_scrape_web: bool = True  # True → parallel PDF+web always; False → fallback only
-
-    # ── Web chunk persistence (replaces in-memory temp store) ─────────────────
+    # Web scraping
+    max_scrape_urls: int = 5
+    ddg_retries: int = 3
+    min_domain_score: int = 55
+    web_top_k: int = 10
+    always_scrape_web: bool = False
     web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
-    # Dedicated ChromaDB collection for web content. Separate from PDF store so
-    # PDF retrieval quality is never diluted by web chunks during index operations.
-
     web_chunk_ttl_hours: int = 24
-    # Hours before a scraped URL is considered stale and eligible for eviction.
-    # Increase for stable reference sites (Wikipedia); decrease for news/live data.
-
     web_collection_max_chunks: int = 8000
-    # Hard cap on total chunks in the web store. When 90% full, the oldest 20%
-    # of URLs (by scrape time) are evicted. Prevents unbounded disk/index growth.
-    # At ~2 KB per chunk: 8000 chunks ≈ 16 MB of text + ChromaDB index overhead.
+    web_fetch_workers: int = 4
+    web_request_timeout_seconds: int = 12
+    web_min_text_chars: int = 400
+    web_min_page_quality: float = 0.45
+    web_min_query_relevance: float = 0.20
+    web_authoritative_domains: tuple[str, ...] = (
+        "cppreference.com", "cplusplus.com", "learn.microsoft.com",
+        "docs.python.org", "developer.mozilla.org", "docs.oracle.com",
+        "kernel.org", "llvm.org", "gnu.org", "iso.org", "arxiv.org",
+        "github.com", "huggingface.co", "langchain.com", "ollama.com",
+    )
+    url_evaluator_enabled: bool = True
+    url_evaluator_min_domain_score: int = 55
+    url_evaluator_max_redirects: int = 5
 
-    # ── Critic thresholds ─────────────────────────────────────────────────────
-    # All formerly hardcoded — change here without touching critic.py or pipeline.py
+    # Critic
+    critic_enabled: bool = True
+    critic_on_low_confidence_only: bool = True
     critic_uncertainty_threshold: float = 0.50
-    # Ratio of hedge sentences in an answer before it is auto-accepted as
-    # "I don't know". Lower = stricter (more answers sent to LLM critic).
-    # 0.50 means half the sentences must be hedges; 0.33 means one in three.
-
     critic_claim_penalty: float = 0.20
-    # Faithfulness score deducted per unsupported claim found by the critic.
-    # score = max(0, 1.0 - penalty × num_claims). Lower = more lenient.
-    # 0.20 → 1 claim = 0.80, 2 claims = 0.60, 5+ claims = 0.0.
+    critic_polish_enabled: bool = False
+    constrained_critic_repair: bool = True
+    critic_max_repair_attempts: int = 1
+    critic_abstain_on_failed_repair: bool = False
+    critic_require_context_grounding: bool = True
+    critic_config_version: int = 3
 
-    # ── Rewriter auto-labeling ────────────────────────────────────────────────
-    rewriter_helpful_min_score:    float = 0.80
-    # Faithfulness score >= this → rewrite is auto-labeled helpful (enters few-shot pool).
-    rewriter_unhelpful_max_score:  float = 0.40
-    # Faithfulness score <  this → rewrite is auto-labeled unhelpful (excluded from pool).
-    # Scores between the two thresholds receive no auto-label (neutral; awaits user rating).
+    # Rewriter
+    rewrite_enabled: bool = True
+    multi_query_max_queries: int = 5
+    rewrite_only_when_ambiguous: bool = False
+    rewriter_helpful_min_score: float = 0.80
+    rewriter_unhelpful_max_score: float = 0.40
+
+    # Chunking
+    chunk_size: int = 500
+    chunk_overlap: int = 75
+
+    # Semantic and hierarchical chunking
+    semantic_chunking_enabled: bool = True
+    semantic_breakpoint_percentile: float = 90.0
+    semantic_min_distance: float = 0.0
+    semantic_min_block_tokens: int = 80
+
+    parent_target_tokens: int = 600
+    parent_max_tokens: int = 900
+    child_max_tokens: int = 220
+    child_overlap_tokens: int = 40
+
+    context_neighbor_count: int = 1
+    context_budget_tokens: int = 6000
+
+    # Query routing / confidence
+    query_routing_enabled: bool = True
+    recommendation_query_expansion_enabled: bool = True
+    answerability_min_top_score: float = 0.0
+    answerability_min_mean_score: float = -0.5
+    answerability_min_chunks: int = 2
+    answerability_min_query_term_coverage: float = 0.70
+    comparison_require_all_options: bool = True
+    low_confidence_requires_web: bool = True
+    destructive_critic_repair: bool = False

@@ -1,26 +1,8 @@
 """
 rewriter.py — Trainable query rewrite pipeline (Rewrite → Retrieve → Read).
-
-How it works:
-  1. rewrite(query) — LLM expands the raw query into a richer retrieval query.
-     Before calling the LLM it pulls up to MAX_FEW_SHOT positive examples from
-     the rewrite history table (rows where was_helpful = 1). These examples
-     are injected as few-shot demonstrations so the rewriter improves over time
-     as feedback accumulates.
-
-  2. record_feedback(rewrite_id, helpful) — called after the pipeline delivers
-     an answer. Marks a rewrite as helpful (1) or not (0). Helpful rewrites
-     become future few-shot examples; unhelpful ones are excluded.
-
-  3. record_answer_score(rewrite_id, score) — stores the critic faithfulness
-     score alongside the rewrite row, giving a continuous quality signal in
-     addition to binary feedback.
-
-"Trainable" in this context means the rewriter's behaviour shifts based on
-accumulated feedback — no gradient updates, but the few-shot pool grows
-and improves, which is the practical lightweight approach for local LLMs.
 """
 import logging
+import re
 import time
 from typing import Optional
 
@@ -28,179 +10,190 @@ from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+from checkpoints import checkpoint
 from config import RAGConfig
 from db import Database
 
 log = logging.getLogger(__name__)
+MAX_FEW_SHOT = 4
 
-MAX_FEW_SHOT = 4   # max positive examples injected into the rewrite prompt
+_STANDALONE_PROMPT = ChatPromptTemplate.from_template("""
+Rewrite the latest user message as one standalone retrieval question.
+Use CHAT HISTORY only to resolve pronouns, ellipsis, and implied subjects.
+Preserve every explicit entity, comparison option, constraint, and requested
+decision criterion from the latest message. Do not add a recommendation,
+assumptions, examples, or a new scope. If it is already standalone, return it
+with only harmless wording cleanup.
 
+CHAT HISTORY:
+{history}
 
-# ── Prompt templates ──────────────────────────────────────────────────────────
+LATEST USER MESSAGE:
+{query}
 
-# Used when no few-shot examples are available yet (cold start)
-_COLD_PROMPT = ChatPromptTemplate.from_template("""
-You are a search query optimizer for a RAG system.
-Rewrite the user's query to maximise retrieval recall.
+Return ONLY the standalone question.""")
 
-Rules:
-- Expand acronyms and add synonyms.
-- Make implicit concepts explicit.
-- Keep the rewritten query under 80 words.
-- Return ONLY the rewritten query — no preamble, no explanation.
+_EXPANSION_PROMPT = ChatPromptTemplate.from_template("""
+You are generating parallel retrieval formulations for a research system.
+Return one retrieval query per line and nothing else.
 
-Original query: {query}
-Rewritten query:""")
-
-# Used once positive examples exist in the rewrite history
-_FEW_SHOT_PROMPT = ChatPromptTemplate.from_template("""
-You are a search query optimizer for a RAG system.
-Rewrite the user's query to maximise retrieval recall.
-
-Here are examples of good rewrites that led to useful answers:
-{examples}
+Generate 3 to 5 alternative formulations of the SAME question.
+Every formulation must seek the same answer as the standalone question.
+Use paraphrases and search-oriented wording to improve recall.
 
 Rules:
-- Follow the style of the examples above.
-- Expand acronyms and add synonyms.
-- Make implicit concepts explicit.
-- Keep the rewritten query under 80 words.
-- Return ONLY the rewritten query — no preamble, no explanation.
+- Do not split the question into subquestions.
+- Do not introduce new entities, concepts, constraints, or decision criteria.
+- Do not ask about causes, benefits, limitations, components, or examples
+    unless the original question asks about them.
+- Preserve the original intent, entities, comparison options, and constraints.
+- Do not answer the question.
+- Produce 3 to 5 distinct queries.
+- Keep each query under 80 words.
+- Do not use bullets, numbering, labels, or explanations.
 
-Original query: {query}
-Rewritten query:""")
+Standalone question: {query}
+Retrieval queries:""")
 
 
 class QueryRewriter:
-    """
-    Trainable query rewriter backed by a SQLite rewrite history.
-
-    Usage:
-        rewriter = QueryRewriter(db, cfg, llm)
-
-        rewrite_id, rewritten = rewriter.rewrite("what did perry do in japan")
-        # → (42, "What were the political and economic consequences of
-        #          Commodore Matthew Perry's 1853 expedition to Edo Bay, Japan,
-        #          and how did it accelerate the Meiji-era westernization?")
-
-        # After the answer is delivered and user rates it:
-        rewriter.record_feedback(rewrite_id, helpful=True)
-        rewriter.record_answer_score(rewrite_id, score=0.91)
-    """
+    """Trainable query rewriter backed by SQLite rewrite history."""
 
     def __init__(self, db: Database, cfg: RAGConfig, llm: ChatOllama) -> None:
-        self.db  = db
+        self.db = db
         self.cfg = cfg
-        self._cold_chain = _COLD_PROMPT    | llm | StrOutputParser()
-        self._few_chain  = _FEW_SHOT_PROMPT | llm | StrOutputParser()
+        self._standalone_chain = _STANDALONE_PROMPT | llm | StrOutputParser()
+        self._expansion_chain = _EXPANSION_PROMPT | llm | StrOutputParser()
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _looks_ambiguous(query: str) -> bool:
+        words = re.findall(r"[A-Za-z0-9_]+", query)
+        if len(words) < 3:
+            return True
+        vague = {"this", "that", "it", "they", "thing", "stuff", "help", "better", "works"}
+        return any(word.lower() in vague for word in words) or len(query.strip()) < 18
+
+    @staticmethod
+    def _needs_expansion(query: str) -> bool:
+        words = re.findall(r"[A-Za-z0-9_]+", query.lower())
+        intent_terms = {
+            "best", "compare", "comparison", "versus", "vs", "recommend",
+            "recommendation", "choose", "alternatives", "differences",
+        }
+        constraint_terms = {
+            "with", "without", "for", "using", "including", "citations",
+            "production", "local", "tool", "tools", "dimensions",
+        }
+        return (
+            any(word in intent_terms for word in words)
+            or sum(word in constraint_terms for word in words) >= 2
+            or query.count(",") >= 2
+            or len(words) >= 18
+        )
+
+    @staticmethod
+    def _is_explicit_comparison(query: str) -> bool:
+        text = query.lower().replace("’", "'")
+        return any(marker in text for marker in (
+            "what's better", "what is better", "which is better", " vs ",
+            " versus ", "compare ", "comparison", "differences between",
+        ))
+
+    @staticmethod
+    def _parse_queries(original: str, output: str, maximum: int) -> list[str]:
+        queries = [original]
+        for line in (output or "").splitlines():
+            candidate = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            if not candidate:
+                continue
+            candidate = QueryRewriter._sanitize(original, candidate)
+            if candidate and candidate.lower() not in {q.lower() for q in queries}:
+                queries.append(candidate)
+            if len(queries) >= maximum:
+                break
+        return queries
 
     def rewrite(self, query: str) -> tuple[int, str]:
-        """
-        Rewrite `query` for better retrieval.
+        """Return the legacy single-query rewrite API."""
+        rewrite_id, queries = self.rewrite_queries(query)
+        return rewrite_id, queries[-1] if len(queries) == 1 else " ".join(queries)
 
-        Returns:
-            (rewrite_id, rewritten_query)
-            rewrite_id is the SQLite row id — pass it back to record_feedback().
-        """
-        examples = self._fetch_positive_examples()
+    def rewrite_queries(self, query: str, chat_history: Optional[list[dict | str]] = None) -> tuple[int, list[str]]:
+        """Resolve the question, then generate bounded parallel retrieval queries."""
+        original = query.strip()
+        if not self.cfg.rewrite_enabled or (
+            self.cfg.rewrite_only_when_ambiguous
+            and not self._looks_ambiguous(original)
+            and not self._needs_expansion(original)
+        ):
+            checkpoint("rewrite.skipped", original, enabled=self.cfg.debug_checkpoints,
+                       preview_chars=self.cfg.checkpoint_preview_chars,
+                       sample_items=self.cfg.checkpoint_sample_items,
+                       reason="disabled_or_clear_query")
+            return 0, [original]
 
-        if examples:
-            example_block = "\n".join(
-                f"  Original:  {ex['original_query']}\n"
-                f"  Rewritten: {ex['rewritten_query']}"
-                for ex in examples
-            )
-            rewritten = self._few_chain.invoke({
-                "query":    query,
-                "examples": example_block,
-            }).strip()
-            log.info(f"[Rewriter] Few-shot ({len(examples)} examples) rewrite done")
-        else:
-            rewritten = self._cold_chain.invoke({"query": query}).strip()
-            log.info("[Rewriter] Cold-start rewrite done")
+        checkpoint("rewrite.input", original, enabled=self.cfg.debug_checkpoints,
+                   preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items)
+        history = "\n".join(
+            item if isinstance(item, str) else f"{item.get('role', 'user')}: {item.get('content', '')}"
+            for item in (chat_history or [])
+        ) or "(No prior conversation.)"
+        standalone = self._sanitize(original, self._standalone_chain.invoke({
+            "query": original, "history": history,
+        }).strip())
+        generated = self._expansion_chain.invoke({"query": standalone}).strip()
+        queries = self._parse_queries(standalone, generated,
+                                     maximum=max(2, int(self.cfg.multi_query_max_queries)))
+        rewritten = "\n".join(queries)
+        rewrite_id = self._store(original, rewritten)
+        checkpoint("rewrite.output", {"original": original, "rewritten": rewritten, "queries": queries},
+                   enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
+                   sample_items=self.cfg.checkpoint_sample_items, rewrite_id=rewrite_id,
+                   changed=(original != rewritten), query_count=len(queries))
+        return rewrite_id, queries
 
-        # Sanitise: if the model returns something unusable, fall back to original
-        if not rewritten or len(rewritten) < 5:
-            log.warning("[Rewriter] LLM returned empty rewrite — using original")
-            rewritten = query
-
-        rewrite_id = self._store(query, rewritten)
-        log.info(f"[Rewriter] '{query[:50]}' →\n           '{rewritten[:80]}'")
-        return rewrite_id, rewritten
+    @staticmethod
+    def _sanitize(original: str, rewritten: str) -> str:
+        candidate = (rewritten or "").strip()
+        if len(candidate) < 5:
+            return original
+        candidate = re.sub(r"^(?:rewritten query|query)\s*:\s*", "", candidate, flags=re.I).strip()
+        candidate = candidate.strip("`\"'")
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        stack = []
+        for char in candidate:
+            if char in pairs:
+                stack.append(pairs[char])
+            elif char in pairs.values() and stack and char == stack[-1]:
+                stack.pop()
+        if stack:
+            candidate += "".join(reversed(stack))
+        return original if candidate.endswith(("(", "[", "{", ":", "-")) else candidate
 
     def record_feedback(self, rewrite_id: int, helpful: bool) -> None:
-        """
-        Mark a rewrite as helpful (True) or not (False).
-        Helpful rewrites join the few-shot pool for future queries.
-        """
         with self.db.connect() as conn:
-            conn.execute(
-                "UPDATE query_rewrites SET was_helpful = ? WHERE id = ?",
-                (1 if helpful else 0, rewrite_id)
-            )
-        log.info(f"[Rewriter] Feedback recorded: id={rewrite_id} helpful={helpful}")
+            conn.execute("UPDATE query_rewrites SET was_helpful = ? WHERE id = ?", (1 if helpful else 0, rewrite_id))
 
     def record_answer_score(self, rewrite_id: int, score: float) -> None:
-        """Store the faithfulness score (0–1) alongside the rewrite row."""
         with self.db.connect() as conn:
-            conn.execute(
-                "UPDATE query_rewrites SET answer_score = ? WHERE id = ?",
-                (round(score, 4), rewrite_id)
-            )
+            conn.execute("UPDATE query_rewrites SET answer_score = ? WHERE id = ?", (round(score, 4), rewrite_id))
 
     def few_shot_pool_size(self) -> int:
-        """How many positive examples are currently in the pool."""
         with self.db.connect() as conn:
-            return conn.execute(
-                "SELECT COUNT(*) as n FROM query_rewrites WHERE was_helpful = 1"
-            ).fetchone()["n"]
+            return conn.execute("SELECT COUNT(*) as n FROM query_rewrites WHERE was_helpful = 1").fetchone()["n"]
 
     def rewrite_stats(self) -> dict:
-        """Summary of rewrite history for the monitoring report."""
         with self.db.connect() as conn:
-            row = conn.execute("""
-                SELECT
-                    COUNT(*)                          AS total,
-                    SUM(CASE WHEN was_helpful=1 THEN 1 ELSE 0 END) AS positive,
-                    SUM(CASE WHEN was_helpful=0 THEN 1 ELSE 0 END) AS negative,
-                    AVG(answer_score)                 AS mean_score
-                FROM query_rewrites
-            """).fetchone()
-        return {
-            "total_rewrites":   row["total"],
-            "positive":         row["positive"],
-            "negative":         row["negative"],
-            "few_shot_pool":    row["positive"],
-            "mean_answer_score": round(row["mean_score"], 3) if row["mean_score"] else None,
-        }
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
+            row = conn.execute("SELECT COUNT(*) AS total, SUM(CASE WHEN was_helpful=1 THEN 1 ELSE 0 END) AS positive, SUM(CASE WHEN was_helpful=0 THEN 1 ELSE 0 END) AS negative, AVG(answer_score) AS mean_score FROM query_rewrites").fetchone()
+        return {"total_rewrites": row["total"], "positive": row["positive"], "negative": row["negative"], "few_shot_pool": row["positive"], "mean_answer_score": round(row["mean_score"], 3) if row["mean_score"] else None}
 
     def _fetch_positive_examples(self) -> list[dict]:
-        """
-        Retrieve the top MAX_FEW_SHOT positive rewrites, ranked by answer_score
-        descending (best-performing first). Falls back to recency if no scores set.
-        """
         with self.db.connect() as conn:
-            rows = conn.execute(
-                """SELECT original_query, rewritten_query, answer_score
-                   FROM query_rewrites
-                   WHERE was_helpful = 1
-                   ORDER BY COALESCE(answer_score, 0) DESC, created_at DESC
-                   LIMIT ?""",
-                (MAX_FEW_SHOT,)
-            ).fetchall()
+            rows = conn.execute("SELECT original_query, rewritten_query, answer_score FROM query_rewrites WHERE was_helpful = 1 ORDER BY COALESCE(answer_score, 0) DESC, created_at DESC LIMIT ?", (MAX_FEW_SHOT,)).fetchall()
         return [dict(r) for r in rows]
 
     def _store(self, original: str, rewritten: str) -> int:
-        """Persist a new rewrite row; returns its auto-increment id."""
         with self.db.connect() as conn:
-            cursor = conn.execute(
-                """INSERT INTO query_rewrites
-                   (original_query, rewritten_query, created_at)
-                   VALUES (?, ?, ?)""",
-                (original, rewritten, time.time())
-            )
+            cursor = conn.execute("INSERT INTO query_rewrites (original_query, rewritten_query, created_at) VALUES (?, ?, ?)", (original, rewritten, time.time()))
             return cursor.lastrowid
