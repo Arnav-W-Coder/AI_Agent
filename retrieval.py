@@ -191,25 +191,6 @@ class HybridRetriever:
     def retrieve_candidates(self, query: str, metadata_filter: Optional[dict] = None) -> tuple[list[dict], set, set]:
         return self.retrieve(query, metadata_filter)
 
-    def fuse_multi_query_candidates(self, query_results: list[tuple[list[dict], set, set]],
-                                    limit: int | None = None) -> tuple[list[dict], set, set]:
-        """Apply reciprocal-rank fusion across independent query result lists."""
-        fused: dict[str, dict] = {}
-        bm25_ids: set = set()
-        dense_ids: set = set()
-        for candidates, query_bm25_ids, query_dense_ids in query_results:
-            bm25_ids.update(query_bm25_ids)
-            dense_ids.update(query_dense_ids)
-            for rank, candidate in enumerate(candidates):
-                identifier = candidate.get("chroma_id") or candidate.get("source_url")
-                if not identifier:
-                    continue
-                entry = fused.setdefault(identifier, {**candidate, "multi_query_rrf_score": 0.0})
-                entry["multi_query_rrf_score"] += self._rrf_score(rank)
-        max_candidates = limit or max(self.cfg.top_k_dense, self.cfg.top_k_sparse)
-        ranked = sorted(fused.values(), key=lambda item: item["multi_query_rrf_score"], reverse=True)
-        return ranked[:max_candidates], bm25_ids, dense_ids
-
     def expand_to_context(self, children: list[dict]) -> list[dict]:
         if not children:
             return []
@@ -220,19 +201,19 @@ class HybridRetriever:
             return children
         placeholders = ",".join("?" for _ in parent_ids)
         with self.db.connect() as conn:
-            rows = conn.execute(f"""SELECT c.id, c.doc_id, c.chunk_index, c.text, c.page_number,
-                    c.end_page, c.section_path, d.filename
-                    FROM chunks c JOIN documents d ON c.doc_id=d.id
-                    WHERE c.chunk_type='parent' AND c.id IN ({placeholders})""", parent_ids).fetchall()
+            rows = conn.execute(f"""SELECT chunks.id, chunks.doc_id, chunks.chunk_index, chunks.text,
+                           chunks.page_number, chunks.end_page, chunks.section_path, documents.filename
+                    FROM chunks JOIN documents ON chunks.doc_id = documents.id
+                    WHERE chunks.chunk_type='parent' AND chunks.id IN ({placeholders})""", parent_ids).fetchall()
             parent_map = {r["id"]: dict(r) for r in rows}
             neighbors: list[dict] = []
             for parent in rows:
                 for delta in range(1, self.cfg.context_neighbor_count + 1):
                     for idx in (parent["chunk_index"] - delta, parent["chunk_index"] + delta):
-                        row = conn.execute("""SELECT c.id, c.doc_id, c.chunk_index, c.text, c.page_number,
-                               c.end_page, c.section_path, d.filename
-                               FROM chunks c JOIN documents d ON c.doc_id=d.id
-                               WHERE c.chunk_type='parent' AND c.doc_id=? AND c.chunk_index=?""", (parent["doc_id"], idx)).fetchone()
+                        row = conn.execute("""SELECT chunks.id, chunks.doc_id, chunks.chunk_index, chunks.text,
+                                       chunks.page_number, chunks.end_page, chunks.section_path, documents.filename
+                               FROM chunks JOIN documents ON chunks.doc_id = documents.id
+                               WHERE chunks.chunk_type='parent' AND chunks.doc_id=? AND chunks.chunk_index=?""", (parent["doc_id"], idx)).fetchone()
                         if row:
                             neighbors.append(dict(row))
         selected: list[dict] = []

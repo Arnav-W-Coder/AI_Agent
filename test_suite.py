@@ -37,6 +37,9 @@ from config import RAGConfig
 from db import Database
 from cache import CacheLayer, _cosine_sim, _emb_to_bytes, _bytes_to_emb
 from metrics import MetricsRecorder, QueryTrace
+from chunking import HierarchicalChunker, ChunkRecord
+from langchain_core.documents import Document
+from url_evaluator import evaluate_url, normalize_url
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -475,6 +478,224 @@ class TestDomainScoring:
         assert _test_score_domain("https://research.ibm.com/blog/rag") >= 80
 
 
+class TestURLCitationsAndSafety:
+    """url_evaluator.py and source provenance — deterministic URL contracts."""
+
+    @pytest.mark.layer1
+    def test_normalize_url_removes_credentials_port_and_fragment(self):
+        assert normalize_url("HTTPS://Example.com:443/docs?q=rag#section") == (
+            "https://example.com/docs?q=rag"
+        )
+        assert normalize_url("http://user:pass@example.com/docs") is None
+
+    @pytest.mark.layer1
+    def test_normalize_url_blocks_non_pages(self):
+        assert normalize_url("http://localhost:8000/private") is None
+        assert normalize_url("https://example.com/image.png") is None
+        assert normalize_url("ftp://example.com/file") is None
+
+    @pytest.mark.layer1
+    def test_evaluate_url_rejects_private_hosts_before_scoring(self, monkeypatch):
+        monkeypatch.setattr("url_evaluator.public_host", lambda host: False)
+        result = evaluate_url("https://example.com/docs")
+        assert result["allowed"] is False
+        assert result["reason"] == "non_public_host"
+
+    @pytest.mark.layer1
+    def test_evaluate_url_applies_minimum_domain_score(self, monkeypatch):
+        monkeypatch.setattr("url_evaluator.public_host", lambda host: True)
+        result = evaluate_url("https://example.com/docs", min_domain_score=100)
+        assert result["approved"] is False
+        assert result["reason"] == "low_domain_authority"
+
+
+class TestChunking:
+    """chunking.py — production hierarchical chunk records."""
+
+    @pytest.fixture
+    def chunker(self, cfg):
+        cfg.semantic_chunking_enabled = False
+        cfg.parent_target_tokens = 80
+        cfg.parent_max_tokens = 100
+        cfg.child_max_tokens = 30
+        cfg.child_overlap_tokens = 3
+        return HierarchicalChunker(cfg, lambda texts: [[1.0, 0.0] for _ in texts])
+
+    @pytest.mark.layer1
+    def test_chunk_preserves_structure_pages_and_relationships(self, chunker):
+        pages = [Document(
+            page_content="# Retrieval\n\nRAG uses retrieval.\n\nRAG uses generation.",
+            metadata={"page": 2},
+        )]
+        parents, children = chunker.chunk(pages, "doc-1")
+        assert parents and children
+        assert all(parent.chunk_type == "parent" for parent in parents)
+        assert all(child.chunk_type == "child" for child in children)
+        assert all(child.parent_id in {p.id for p in parents} for child in children)
+        assert all(parent.start_page == 3 for parent in parents)
+        assert all(child.metadata["doc_id"] == "doc-1" for child in children)
+
+    @pytest.mark.layer1
+    def test_chunk_falls_back_when_semantic_embeddings_fail(self, cfg):
+        cfg.semantic_chunking_enabled = True
+        cfg.semantic_min_block_tokens = 1
+        chunker = HierarchicalChunker(cfg, lambda texts: (_ for _ in ()).throw(RuntimeError("offline")))
+        paragraphs = ["First topic.", "Second topic."]
+        assert chunker._semantic_blocks(paragraphs) == paragraphs
+
+
+class TestCriticAndAnswerControls:
+    """critic.py and pipeline.py pure control paths without an LLM."""
+
+    @pytest.fixture
+    def critic(self, cfg):
+        from critic import CriticAndRepair
+        instance = CriticAndRepair.__new__(CriticAndRepair)
+        instance._cfg = cfg
+        instance.last_details = {}
+        return instance
+
+    @pytest.mark.layer1
+    def test_critic_evaluate_short_circuits_missing_context(self, critic):
+        result = critic.evaluate("question", "answer", "")
+        assert result["verdict"] == "HALLUCINATED"
+        assert result["severity"] == "major"
+        assert result["repairable"] is False
+
+    @pytest.mark.layer1
+    def test_critic_evaluate_accepts_uncertainty_response(self, critic):
+        result = critic.evaluate("question", "I don't know.", "irrelevant context")
+        assert result["verdict"] == "PASS"
+        assert critic.last_details["groundedness"] == "PASS"
+
+    @pytest.mark.layer1
+    def test_critic_parses_three_dimensions_and_claims(self, critic):
+        result = critic._parse_critic_output(
+            "GROUNDEDNESS: FAIL\nCOMPLETENESS: PASS\nRELEVANCE: PASS\n"
+            "SCORE: 0.25\nISSUES:\n- unsupported date\n- invented name"
+        )
+        assert result["verdict"] == "HALLUCINATED"
+        assert result["severity"] == "major"
+        assert result["unsupported_claims"] == ["unsupported date", "invented name"]
+        assert critic.last_details == {
+            "groundedness": "FAIL", "completeness": "PASS", "relevance": "PASS"
+        }
+
+    @pytest.mark.layer1
+    def test_polish_and_faithfulness_use_production_logic(self, critic):
+        assert critic.polish("Based on the retrieved context, RAG is useful.") == "RAG is useful."
+        assert critic.polish("I don't know.") == "I don't have enough information to answer this confidently."
+        assert critic.compute_faithfulness("HALLUCINATED", "- a\n- b\n- c") == 0.6
+
+    @pytest.mark.layer1
+    def test_answer_sanitizer_removes_only_wrappers(self):
+        from pipeline import ProductionRAGPipeline
+        raw = "Final Answer: <think>hidden reasoning</think>\nThe answer is supported."
+        assert ProductionRAGPipeline._sanitize_answer(raw) == "The answer is supported."
+
+    @pytest.mark.layer1
+    def test_answerability_requires_top_and_mean_scores(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.answerability_min_chunks = 2
+        cfg.answerability_min_top_score = 0.7
+        cfg.answerability_min_mean_score = 0.6
+        assert instance._is_answerable([
+            {"rerank_score": 0.8}, {"rerank_score": 0.7}
+        ]) is True
+        assert instance._is_answerable([
+            {"rerank_score": 0.9}, {"rerank_score": 0.1}
+        ]) is False
+
+    @pytest.mark.layer1
+    def test_context_and_url_provenance_preserve_citations(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        chunk = {
+            "source_type": "web", "source_url": "https://example.com/research",
+            "title": "RAG research", "text": "Grounded evidence.",
+            "rerank_score": 0.81234, "domain_score": 88,
+        }
+        context = instance._format_context([chunk])
+        provenance = instance._source_provenance(chunk, 1)
+        assert "url https://example.com/research" in context
+        assert provenance["domain"] == "example.com"
+        assert provenance["rerank_score"] == 0.812
+
+
+class TestQueryRewriteControls:
+    """rewriter.py parsing and policy logic without an LLM."""
+
+    @pytest.mark.layer1
+    def test_rewriter_sanitizes_labels_and_balances_brackets(self):
+        from rewriter import QueryRewriter
+        assert QueryRewriter._sanitize("original", "Query: 'what is RAG'") == "what is RAG"
+        assert QueryRewriter._sanitize("original", "what is RAG (") == "what is RAG ()"
+        assert QueryRewriter._sanitize("original", "compare RAG [retrieval") == "compare RAG [retrieval]"
+
+    @pytest.mark.layer1
+    def test_rewriter_parses_bounded_unique_queries(self):
+        from rewriter import QueryRewriter
+        queries = QueryRewriter._parse_queries(
+            "compare vector databases",
+            "- compare vector databases\n2. ChromaDB features\nQdrant features\nWeaviate features",
+            maximum=3,
+        )
+        assert queries == ["compare vector databases", "ChromaDB features", "Qdrant features"]
+
+    @pytest.mark.layer1
+    @pytest.mark.parametrize("query", ["what is RAG", "compare RAG and BM25", "how to configure Ollama"])
+    def test_rewriter_policy_classifies_queries(self, query):
+        from rewriter import QueryRewriter
+        assert isinstance(QueryRewriter._looks_ambiguous(query), bool)
+        assert isinstance(QueryRewriter._needs_expansion(query), bool)
+
+
+class TestIngestion:
+    """ingestion.py — file identity, parent storage, and embedding persistence."""
+
+    @pytest.mark.layer1
+    def test_file_hash_changes_when_document_changes(self, tmp_dir):
+        from ingestion import _file_hash
+        path = tmp_dir / "doc.pdf"
+        path.write_bytes(b"version one")
+        first = _file_hash(path)
+        path.write_bytes(b"version two")
+        assert _file_hash(path) != first
+
+    @pytest.mark.layer1
+    def test_store_parents_writes_full_text_and_metadata(self, db, cfg, tmp_dir):
+        from ingestion import AsyncIngestionPipeline
+        pipeline = AsyncIngestionPipeline.__new__(AsyncIngestionPipeline)
+        pipeline.db = db
+        pipeline.cfg = cfg
+        _insert_doc(db, "doc.pdf")
+        parent = ChunkRecord("parent-1", "Parent content", "parent", -1, None, 1, 1, "Intro")
+        with db.connect() as conn:
+            doc_id = conn.execute("SELECT id FROM documents WHERE filename = ?", ("doc.pdf",)).fetchone()[0]
+        pipeline._store_parents([parent], doc_id, str(tmp_dir / "doc.pdf"))
+        with db.connect() as conn:
+            row = conn.execute("SELECT * FROM chunks WHERE id = ?", ("parent-1",)).fetchone()
+        assert row["text"] == "Parent content"
+        assert row["chunk_type"] == "parent"
+        assert row["section_path"] == "Intro"
+
+    @pytest.mark.layer1
+    def test_already_ingested_requires_matching_file_hash(self, db, cfg, tmp_dir):
+        from ingestion import AsyncIngestionPipeline
+        pipeline = AsyncIngestionPipeline.__new__(AsyncIngestionPipeline)
+        pipeline.db = db
+        path = tmp_dir / "doc.pdf"
+        path.write_bytes(b"same")
+        doc_id = _insert_doc(db, path.name)
+        with db.connect() as conn:
+            conn.execute("UPDATE documents SET filepath = ?, file_hash = ? WHERE id = ?", (str(path), "hash", doc_id))
+        assert pipeline._already_ingested(path, "hash") is True
+        assert pipeline._already_ingested(path, "changed") is False
+
+
 # ── Inlined from critic.py — pure Python, no langchain imports needed ────────
 
 _UNCERTAINTY_PHRASES_COPY = [
@@ -485,7 +706,7 @@ _UNCERTAINTY_PHRASES_COPY = [
 ]
 
 def _is_uncertainty(answer: str) -> bool:
-    sentences = [s.strip() for s in answer.split(".") if s.strip()]
+    sentences = [s.strip() for s in _re.split(r"[.!?]+", answer) if s.strip()]
     if not sentences:
         return False
     count = sum(1 for s in sentences
