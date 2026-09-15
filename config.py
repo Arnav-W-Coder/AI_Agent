@@ -89,6 +89,11 @@ class RAGConfig:
     critic_uncertainty_threshold: float = 0.50
     critic_claim_penalty: float = 0.20
     critic_polish_enabled: bool = False
+    constrained_critic_repair: bool = True
+    critic_max_repair_attempts: int = 1
+    critic_abstain_on_failed_repair: bool = True
+    critic_require_context_grounding: bool = True
+    critic_config_version: int = 2
 
     # Rewriter
     rewrite_enabled: bool = True

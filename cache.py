@@ -97,13 +97,28 @@ class CacheLayer:
                    preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
                    query=query, stored=len(chunks))
 
-    def get_answer(self, query: str, query_embedding: np.ndarray) -> Optional[tuple[str, list]]:
+    def get_answer(self, query: str, query_embedding: np.ndarray,
+                   cache_key: Optional[str] = None,
+                   include_metadata: bool = False):
+        lookup_query = cache_key or query
         now = time.time()
-        checkpoint("cache.answer_lookup_input", {"query": query, "embedding_dimension": len(query_embedding)},
+        checkpoint("cache.answer_lookup_input", {"query": query, "cache_key": lookup_query,
+                                                  "embedding_dimension": len(query_embedding)},
                    enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
                    sample_items=self.cfg.checkpoint_sample_items)
         with self.db.connect() as conn:
-            rows = conn.execute("SELECT id, query_embedding, answer, sources_json, expires_at FROM answer_cache WHERE expires_at > ?", (now,)).fetchall()
+            if cache_key:
+                rows = conn.execute(
+                    "SELECT id, query_embedding, answer, sources_json, answer_metadata_json, expires_at "
+                    "FROM answer_cache WHERE query_text = ? AND expires_at > ?",
+                    (lookup_query, now),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, query_embedding, answer, sources_json, answer_metadata_json, expires_at "
+                    "FROM answer_cache WHERE expires_at > ? "
+                    "AND query_text NOT LIKE '%critic_config_version=%'", (now,)
+                ).fetchall()
         if not rows:
             checkpoint("cache.answer_miss", {"query": query}, enabled=self.cfg.debug_checkpoints,
                        preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
@@ -122,10 +137,11 @@ class CacheLayer:
             with self.db.connect() as conn:
                 conn.execute("UPDATE answer_cache SET hit_count = hit_count + 1 WHERE id = ?", (best_row["id"],))
             answer, sources = best_row["answer"], json.loads(best_row["sources_json"] or "[]")
+            metadata = json.loads(best_row["answer_metadata_json"] or "{}")
             checkpoint("cache.answer_hit", {"answer": answer, "sources": sources},
                        enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
                        sample_items=self.cfg.checkpoint_sample_items, similarity=round(best_sim, 4))
-            return answer, sources
+            return (answer, sources, metadata) if include_metadata else (answer, sources)
 
         log.info(f"[Cache] Answer cache MISS (best_sim={best_sim:.3f})")
         checkpoint("cache.answer_miss", {"query": query}, enabled=self.cfg.debug_checkpoints,
@@ -133,17 +149,24 @@ class CacheLayer:
                    best_similarity=round(best_sim, 4), threshold=self.cfg.answer_sim_threshold)
         return None
 
-    def set_answer(self, query: str, query_embedding: np.ndarray, answer: str, sources: list) -> None:
-        qhash = _query_hash(query)
+    def set_answer(self, query: str, query_embedding: np.ndarray, answer: str, sources: list,
+                   cache_key: Optional[str] = None, metadata: Optional[dict] = None) -> None:
+        storage_query = cache_key or query
+        qhash = _query_hash(storage_query)
         now = time.time()
         with self.db.connect() as conn:
             conn.execute("""INSERT INTO answer_cache
                    (query_hash, query_text, query_embedding, answer,
-                    sources_json, created_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                       sources_json, answer_metadata_json, created_at, expires_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(query_hash) DO UPDATE SET
-                       answer = excluded.answer, expires_at = excluded.expires_at, hit_count = 0""",
-                         (qhash, query, _emb_to_bytes(query_embedding), answer, json.dumps(sources), now, now + self.cfg.answer_ttl))
+                       answer = excluded.answer,
+                       sources_json = excluded.sources_json,
+                       answer_metadata_json = excluded.answer_metadata_json,
+                       expires_at = excluded.expires_at,
+                       hit_count = 0""",
+                         (qhash, storage_query, _emb_to_bytes(query_embedding), answer, json.dumps(sources),
+                          json.dumps(metadata or {}), now, now + self.cfg.answer_ttl))
         checkpoint("cache.answer_store", {"answer": answer, "sources": sources},
                    enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
                    sample_items=self.cfg.checkpoint_sample_items, query=query)

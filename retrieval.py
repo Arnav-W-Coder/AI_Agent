@@ -96,6 +96,25 @@ class CrossEncoderReranker:
                    sample_items=samples, query=query, input_count=len(chunks), returned=len(results), min_score=min_score)
         return results
 
+    def rerank_queries(self, queries: list[str], chunks: list[dict], top_k: int,
+                       min_score: float) -> list[dict]:
+        """Rerank merged candidates by their strongest matching query."""
+        if not chunks:
+            return []
+        queries = [query for query in queries if query.strip()]
+        if not queries:
+            return self.rerank("", chunks, top_k, min_score)
+        pairs = [
+            (query, chunk.get("text", chunk.get("text_preview", "")))
+            for query in queries
+            for chunk in chunks
+        ]
+        raw_scores = np.asarray(self._model.predict(pairs)).reshape(len(queries), len(chunks))
+        for index, chunk in enumerate(chunks):
+            chunk["rerank_score"] = round(float(raw_scores[:, index].max()), 4)
+        ranked = sorted(chunks, key=lambda chunk: chunk["rerank_score"], reverse=True)
+        return [chunk for chunk in ranked if chunk["rerank_score"] >= min_score][:top_k]
+
 
 class HybridRetriever:
     def __init__(self, vectorstore: Chroma, bm25_index: BM25Index,

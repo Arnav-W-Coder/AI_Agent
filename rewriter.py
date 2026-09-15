@@ -53,6 +53,27 @@ Rules:
 Original query: {query}
 Rewritten query:""")
 
+_EXPANSION_PROMPT = ChatPromptTemplate.from_template("""
+You are expanding a search query for a retrieval-augmented research system.
+Return one retrieval query per line and nothing else.
+
+Include:
+- the user's original intent, preserving every named subject and constraint;
+- an intent-focused query;
+- important synonyms and expanded acronyms;
+- comparison dimensions when the query compares options;
+- focused subqueries for major entities or constraints when useful.
+
+Rules:
+- Keep the original meaning and scope. Do not answer the question.
+- Produce 3 to 6 distinct queries for complex, comparative, or recommendation
+    questions; produce 1 to 2 for other questions.
+- Keep each query under 80 words.
+- Do not use bullets, numbering, labels, or explanations.
+
+Original query: {query}
+Retrieval queries:""")
+
 
 class QueryRewriter:
     """Trainable query rewriter backed by SQLite rewrite history."""
@@ -62,6 +83,7 @@ class QueryRewriter:
         self.cfg = cfg
         self._cold_chain = _COLD_PROMPT | llm | StrOutputParser()
         self._few_chain = _FEW_SHOT_PROMPT | llm | StrOutputParser()
+        self._expansion_chain = _EXPANSION_PROMPT | llm | StrOutputParser()
 
     @staticmethod
     def _looks_ambiguous(query: str) -> bool:
@@ -71,17 +93,56 @@ class QueryRewriter:
         vague = {"this", "that", "it", "they", "thing", "stuff", "help", "better", "works"}
         return any(word.lower() in vague for word in words) or len(query.strip()) < 18
 
+    @staticmethod
+    def _needs_expansion(query: str) -> bool:
+        words = re.findall(r"[A-Za-z0-9_]+", query.lower())
+        intent_terms = {
+            "best", "compare", "comparison", "versus", "vs", "recommend",
+            "recommendation", "choose", "alternatives", "differences",
+        }
+        constraint_terms = {
+            "with", "without", "for", "using", "including", "citations",
+            "production", "local", "tool", "tools", "dimensions",
+        }
+        return (
+            any(word in intent_terms for word in words)
+            or sum(word in constraint_terms for word in words) >= 2
+            or query.count(",") >= 2
+            or len(words) >= 18
+        )
+
+    @staticmethod
+    def _parse_queries(original: str, output: str, maximum: int) -> list[str]:
+        queries = [original]
+        for line in (output or "").splitlines():
+            candidate = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            if not candidate:
+                continue
+            candidate = QueryRewriter._sanitize(original, candidate)
+            if candidate and candidate.lower() not in {q.lower() for q in queries}:
+                queries.append(candidate)
+            if len(queries) >= maximum:
+                break
+        return queries
+
     def rewrite(self, query: str) -> tuple[int, str]:
-        """Rewrite only when enabled and the query is likely ambiguous."""
+        """Return the legacy single-query rewrite API."""
+        rewrite_id, queries = self.rewrite_queries(query)
+        return rewrite_id, queries[-1] if len(queries) == 1 else " ".join(queries)
+
+    def rewrite_queries(self, query: str) -> tuple[int, list[str]]:
+        """Return retrieval queries, expanding complex intents when useful."""
         original = query.strip()
         if not self.cfg.rewrite_enabled or (
-            self.cfg.rewrite_only_when_ambiguous and not self._looks_ambiguous(original)
+            self.cfg.rewrite_only_when_ambiguous
+            and not self._looks_ambiguous(original)
+            and not self._needs_expansion(original)
         ):
             checkpoint("rewrite.skipped", original, enabled=self.cfg.debug_checkpoints,
                        preview_chars=self.cfg.checkpoint_preview_chars,
                        sample_items=self.cfg.checkpoint_sample_items,
                        reason="disabled_or_clear_query")
-            return 0, original
+            return 0, [original]
 
         checkpoint("rewrite.input", original, enabled=self.cfg.debug_checkpoints,
                    preview_chars=self.cfg.checkpoint_preview_chars,
@@ -91,17 +152,22 @@ class QueryRewriter:
             f"  Original:  {ex['original_query']}\n  Rewritten: {ex['rewritten_query']}"
             for ex in examples
         )
-        if examples:
+        if self._needs_expansion(original):
+            generated = self._expansion_chain.invoke({"query": original}).strip()
+            queries = self._parse_queries(original, generated, maximum=6)
+        elif examples:
             rewritten = self._few_chain.invoke({"query": original, "examples": example_block}).strip()
+            queries = self._parse_queries(original, self._sanitize(original, rewritten), maximum=2)
         else:
             rewritten = self._cold_chain.invoke({"query": original}).strip()
-        rewritten = self._sanitize(original, rewritten)
+            queries = self._parse_queries(original, self._sanitize(original, rewritten), maximum=2)
+        rewritten = "\n".join(queries)
         rewrite_id = self._store(original, rewritten)
-        checkpoint("rewrite.output", {"original": original, "rewritten": rewritten},
+        checkpoint("rewrite.output", {"original": original, "rewritten": rewritten, "queries": queries},
                    enabled=self.cfg.debug_checkpoints, preview_chars=self.cfg.checkpoint_preview_chars,
                    sample_items=self.cfg.checkpoint_sample_items, rewrite_id=rewrite_id,
-                   changed=(original != rewritten))
-        return rewrite_id, rewritten
+                   changed=(original != rewritten), query_count=len(queries))
+        return rewrite_id, queries
 
     @staticmethod
     def _sanitize(original: str, rewritten: str) -> str:

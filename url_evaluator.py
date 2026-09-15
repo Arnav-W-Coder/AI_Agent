@@ -102,18 +102,21 @@ def evaluate_url(url: str, *, min_domain_score: int = 55) -> dict:
     normalized = normalize_url(url)
     if not normalized:
         return {
-            "approved": False, "reason": "invalid_or_blocked_url", "url": None,
+            "allowed": False, "approved": False,
+            "reason": "invalid_or_blocked_url", "url": None,
             "normalized_url": None, "host": None, "domain_score": 0,
         }
     host = urlsplit(normalized).hostname or ""
     if not public_host(host):
         return {
-            "approved": False, "reason": "non_public_host", "url": normalized,
+            "allowed": False, "approved": False,
+            "reason": "non_public_host", "url": normalized,
             "normalized_url": normalized, "host": host, "domain_score": 0,
         }
     score, reasons = _domain_score(host, normalized)
     approved = score >= min_domain_score
     return {
+        "allowed": approved,
         "approved": approved,
         "reason": "approved" if approved else "low_domain_authority",
         "url": normalized,

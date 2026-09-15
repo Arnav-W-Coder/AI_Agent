@@ -1,5 +1,6 @@
 """pipeline.py — Production RAG orchestration."""
 import ipaddress
+import hashlib
 import logging
 import re
 import socket
@@ -54,23 +55,6 @@ QUESTION: {question}
 ANSWER:
 """)
 
-# Higher scores are used for known authoritative sources. Wikipedia is
-# intentionally below primary/official sources and is only admitted as a
-# secondary source by _select_web_results().
-_DOMAIN_SCORES: dict[str, int] = {
-    "docs.python.org": 100, "cppreference.com": 100, "cplusplus.com": 90,
-    "learn.microsoft.com": 95, "developer.mozilla.org": 95,
-    "docs.oracle.com": 95, "aws.amazon.com": 90, "cloud.google.com": 90,
-    "openai.com": 90, "anthropic.com": 90, "langchain.com": 88,
-    "arxiv.org": 96, "pubmed.ncbi.nlm.nih.gov": 100,
-    "britannica.com": 90, "research.ibm.com": 90,
-    "github.com": 82, "stackoverflow.com": 78,
-    "huggingface.co": 82, "towardsdatascience.com": 65, "medium.com": 55,
-    "wikipedia.org": 60,
-    "pinterest.com": 0, "facebook.com": 0, "twitter.com": 0,
-    "x.com": 0, "tiktok.com": 0, "grokipedia.com": 10,
-}
-
 _BLOCKED_HOSTS = {
     "localhost", "localhost.localdomain", "metadata.google.internal",
     "metadata.google",
@@ -79,33 +63,6 @@ _BLOCKED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".mp3", ".mp4",
     ".avi", ".mov", ".zip", ".rar", ".7z", ".exe", ".dmg", ".iso",
 }
-
-
-def _score_domain(url: str) -> int:
-    try:
-        host = urlsplit(url).hostname
-        if not host:
-            return 0
-        host = host.lower().rstrip(".")
-    except Exception:
-        return 0
-    if host in _DOMAIN_SCORES:
-        return _DOMAIN_SCORES[host]
-    parts = host.split(".")
-    for i in range(len(parts) - 1):
-        suffix = ".".join(parts[i:])
-        if suffix in _DOMAIN_SCORES:
-            return _DOMAIN_SCORES[suffix]
-    if len(parts) >= 2 and parts[-1] in {"gov", "edu"}:
-        return 92
-    return 60
-
-
-def _is_wikipedia(url: str) -> bool:
-    try:
-        return (urlsplit(url).hostname or "").lower().rstrip(".").removeprefix("www.") == "wikipedia.org"
-    except Exception:
-        return False
 
 
 def _normalize_url(url: str) -> Optional[str]:
@@ -149,51 +106,283 @@ def _host_is_public(host: str) -> bool:
     return True
 
 
-def _web_tier(url: str) -> int:
-    """3=preferred/primary, 2=credible secondary, 1=Wikipedia, 0=blocked."""
-    score = _score_domain(url)
-    if score <= 0:
-        return 0
-    if _is_wikipedia(url):
-        return 1
-    if score >= 85:
-        return 3
-    if score >= 65:
-        return 2
-    return 1
-
-
-def _select_web_results(results: list[dict], limit: int) -> list[dict]:
-    """Prefer primary/credible sources; Wikipedia can never outrank them."""
+def _select_web_results(results: list[dict], limit: int, min_domain_score: int) -> list[dict]:
+    """Deduplicate and select search results approved by the URL evaluator."""
     candidates = []
     seen = set()
     for result in results:
-        normalized = _normalize_url(result.get("href", ""))
+        evaluation = evaluate_url(
+            result.get("href", ""),
+            min_domain_score=min_domain_score,
+        )
+        if not evaluation["allowed"]:
+            continue
+        normalized = evaluation["normalized_url"]
         if not normalized or normalized in seen:
             continue
         seen.add(normalized)
         item = dict(result)
         item["href"] = normalized
-        item["_domain_score"] = _score_domain(normalized)
-        item["_web_tier"] = _web_tier(normalized)
-        if item["_web_tier"] > 0:
-            candidates.append(item)
-
-    non_wiki = [r for r in candidates if not _is_wikipedia(r["href"])]
-    wiki = [r for r in candidates if _is_wikipedia(r["href"])]
-    non_wiki.sort(key=lambda r: (r["_web_tier"], r["_domain_score"]), reverse=True)
-    wiki.sort(key=lambda r: r["_domain_score"], reverse=True)
-
-    selected = non_wiki[:limit]
-    # Wikipedia is a fallback, never the first choice. At most one Wikipedia
-    # result can be used, and only when fewer than two stronger sources exist.
-    if len(selected) < limit and len(non_wiki) < 2 and wiki:
-        selected.append(wiki[0])
-    return selected
+        item["domain_score"] = evaluation["domain_score"]
+        item["domain_score_reasons"] = evaluation["domain_score_reasons"]
+        candidates.append(item)
+    return candidates[:limit]
 
 
 class ProductionRAGPipeline:
     """Wire ingestion, retrieval, generation, evaluation, and monitoring."""
+
+    @staticmethod
+    def _classify_query(question: str) -> str:
+        """Classify query intent using inexpensive lexical signals."""
+        text = question.strip().lower()
+        words = set(re.findall(r"[a-z0-9_]+", text))
+        if any(marker in text for marker in ("stack trace", "traceback", "error:",
+                                              "exception", "not working", "fails", "failure")):
+            return "troubleshooting"
+        if any(marker in text for marker in ("compare ", "comparison", " versus ", " vs ",
+                                              "differences between", "which is better")):
+            return "comparison"
+        if any(word in words for word in ("best", "recommend", "recommendation", "alternatives")):
+            return "recommendation"
+        if any(marker in text for marker in ("survey", "state of the art", "literature", "research",
+                                              "evidence", "papers", "according to multiple")):
+            return "research"
+        if any(marker in text for marker in ("how do i", "how to ", "steps to", "guide to",
+                                              "tutorial", "install", "configure", "set up")):
+            return "how_to"
+        if any(marker in text for marker in ("what is ", "what are ", "define ", "definition of ")):
+            return "definition"
+        if len(words) >= 18 or text.count(",") >= 2 or sum(
+            word in words for word in ("with", "without", "including", "using", "for")
+        ) >= 2:
+            return "multi_constraint"
+        if any(marker in text for marker in ("why ", "explain ", "how does ", "how do ")):
+            return "explanation"
+        return "explanation"
+
+    @staticmethod
+    def _named_options(question: str) -> list[str]:
+        """Extract simple comma/and-separated options from comparison queries."""
+        subject = re.split(r"\bfor\b", question, maxsplit=1, flags=re.IGNORECASE)[0]
+        subject = re.sub(r"^.*?\b(?:compare|comparison of|differences between)\b", "", subject,
+                         flags=re.IGNORECASE)
+        parts = re.split(r",|\band\b|\bvs\.?\b|\bversus\b", subject, flags=re.IGNORECASE)
+        options = []
+        for part in parts:
+            value = re.sub(r"[^A-Za-z0-9+#. -]", "", part).strip(" -")
+            if 2 <= len(value.split()) <= 5 and value.lower() not in {"what", "which"}:
+                options.append(value)
+        return list(dict.fromkeys(options))
+
+    @staticmethod
+    def _recommendation_queries(question: str, rewritten_queries: list[str]) -> list[str]:
+        """Build complementary retrieval queries for recommendation intents."""
+        original = question.strip()
+        rewritten = next(
+            (query.strip() for query in rewritten_queries
+             if query.strip().lower() != original.lower()),
+            original,
+        )
+        topic = re.sub(
+            r"^\s*(?:what are|what is|which are|which is|recommend|suggest)\b",
+            "",
+            original,
+            flags=re.IGNORECASE,
+        )
+        topic = re.sub(r"\b(?:the )?(?:best|top|recommended)\b", "", topic, flags=re.IGNORECASE)
+        topic = re.sub(r"\s+", " ", topic).strip(" ?.") or original
+        return list(dict.fromkeys([
+            rewritten,
+            f"best options for {topic}",
+            f"{topic} comparison",
+            f"{topic} advantages disadvantages",
+            f"{topic} production use cases",
+        ]))
+
+    def _route_query(self, question: str, query_type: str,
+                     queries: list[str]) -> dict:
+        """Build the retrieval plan for a classified query."""
+        plan = {
+            "queries": list(dict.fromkeys(queries or [question])),
+            "top_k": self.cfg.top_k_rerank,
+            "candidate_k": self.cfg.top_k_rerank,
+            "always_web": self.cfg.always_scrape_web,
+            "diversify": False,
+        }
+        if not self.cfg.query_routing_enabled:
+            return plan
+        if query_type == "definition":
+            plan["queries"] = [question]
+            plan["top_k"] = min(self.cfg.top_k_rerank, 3)
+        elif query_type == "how_to":
+            plan["queries"] = [f"{query} documentation reference guide" for query in plan["queries"]]
+        elif query_type == "comparison":
+            plan["queries"].extend(f"{option} {question}" for option in self._named_options(question))
+            plan["diversify"] = True
+            plan["candidate_k"] = max(self.cfg.top_k_rerank * 2, self.cfg.top_k_rerank + 2)
+        elif query_type == "recommendation":
+            if self.cfg.recommendation_query_expansion_enabled:
+                plan["queries"] = self._recommendation_queries(question, plan["queries"])
+            else:
+                plan["queries"] = [question]
+            plan["diversify"] = True
+            plan["candidate_k"] = max(self.cfg.top_k_rerank * 2, self.cfg.top_k_rerank + 2)
+        elif query_type == "troubleshooting":
+            plan["queries"].append(f"{question} exact error message solution")
+        elif query_type == "research":
+            plan["always_web"] = True
+            plan["diversify"] = True
+            plan["top_k"] = max(self.cfg.top_k_rerank, 6)
+            plan["candidate_k"] = max(plan["top_k"] * 2, plan["top_k"] + 2)
+        elif query_type == "multi_constraint":
+            plan["diversify"] = True
+            plan["candidate_k"] = max(self.cfg.top_k_rerank * 2, self.cfg.top_k_rerank + 2)
+        return plan
+
+    @staticmethod
+    def _diversify_sources(chunks: list[dict], query_type: str, limit: int,
+                           max_per_source: int = 2, max_per_domain: int = 3) -> list[dict]:
+        """Select relevant chunks while preserving independent sources."""
+        if query_type not in {"comparison", "recommendation", "research", "multi_constraint"}:
+            return chunks[:limit]
+
+        remaining = sorted(
+            chunks,
+            key=lambda chunk: chunk.get("rerank_score", 0.0),
+            reverse=True,
+        )
+        selected = []
+        source_counts: dict[str, int] = {}
+        domain_counts: dict[str, int] = {}
+        score_tolerance = 0.5
+
+        while remaining and len(selected) < limit:
+            eligible = []
+            for chunk in remaining:
+                source = chunk.get("source_url") or chunk.get("filename") or chunk.get("chroma_id") or "unknown"
+                domain = urlsplit(source).hostname if "://" in source else source
+                if source_counts.get(source, 0) < max_per_source and domain_counts.get(domain, 0) < max_per_domain:
+                    eligible.append((chunk, source, domain))
+            if not eligible:
+                break
+
+            best_score = eligible[0][0].get("rerank_score", 0.0)
+            unseen_domain = next(
+                (item for item in eligible
+                 if domain_counts.get(item[2], 0) == 0
+                 and best_score - item[0].get("rerank_score", 0.0) <= score_tolerance),
+                None,
+            )
+            chunk, source, domain = unseen_domain or eligible[0]
+            selected.append(chunk)
+            source_counts[source] = source_counts.get(source, 0) + 1
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            remaining.remove(chunk)
+
+        return selected
+
+    def _is_answerable(self, chunks: list[dict]) -> bool:
+        scores = [
+            float(chunk.get("rerank_score", 0.0))
+            for chunk in chunks
+            if "rerank_score" in chunk
+        ]
+        if len(chunks) < self.cfg.answerability_min_chunks or not scores:
+            return False
+        return (
+            max(scores) >= self.cfg.answerability_min_top_score
+            and sum(scores) / len(scores) >= self.cfg.answerability_min_mean_score
+        )
+
+    @staticmethod
+    def _insufficient_information_response(question: str) -> str:
+        return "I don't have enough information to answer this confidently."
+
+    def _repair_answer(self, question: str, answer: str, critic_result: dict,
+                       context: str) -> tuple[str | None, str]:
+        """Apply the configured repair policy in one place."""
+        if not self.cfg.critic_enabled:
+            return answer, "critic_disabled"
+        verdict = critic_result.get("verdict")
+        if verdict == "PASS":
+            return answer, "none"
+        if verdict == "UNCERTAIN":
+            return answer, "uncertain"
+
+        severity = critic_result.get("severity", "major")
+        critique = critic_result.get("critique", "")
+        if severity == "minor" and self.cfg.constrained_critic_repair:
+            repaired = self.critic.repair_constrained(question, context, answer, critique)
+            return (repaired, "constrained") if repaired else (None, "abstain")
+        if severity == "major" and self.cfg.destructive_critic_repair:
+            repaired = self.critic.repair_destructive(question, context, answer, critique)
+            return (repaired, "destructive") if repaired else (None, "abstain")
+        if self.cfg.constrained_critic_repair:
+            repaired = self.critic.repair_constrained(question, context, answer, critique)
+            if repaired:
+                return repaired, "constrained"
+        if self.cfg.critic_abstain_on_failed_repair:
+            return None, "abstain"
+        return answer, "unrepaired"
+
+    @staticmethod
+    def _page_quality(text: str, title: str, query: str, domain_score: float,
+                      meaningful_paragraphs: int) -> tuple[float, float]:
+        query_terms = {term for term in re.findall(r"[a-z0-9]+", query.lower()) if len(term) > 2}
+        page_text = f"{title} {text}".lower()
+        matched = sum(term in page_text for term in query_terms)
+        query_relevance = matched / len(query_terms) if query_terms else 0.0
+        length_quality = min(len(text) / 1800.0, 1.0)
+        paragraph_quality = min(meaningful_paragraphs / 8.0, 1.0)
+        boilerplate_penalty = 0.25 if meaningful_paragraphs <= 1 else 0.0
+        content_quality = max(0.0, min(1.0, 0.55 * length_quality + 0.45 * paragraph_quality - boilerplate_penalty))
+        page_quality = (
+            0.35 * (domain_score / 100.0)
+            + 0.30 * content_quality
+            + 0.25 * query_relevance
+            + 0.10
+        )
+        return round(min(1.0, page_quality), 4), round(query_relevance, 4)
+
+    def _broader_web_retrieval(self, question: str, queries: list[str],
+                               chunks: list[dict], query_type: str,
+                               limit: int) -> list[dict]:
+        """Retry weak retrieval with broader web evidence before generation."""
+        broader_queries = list(dict.fromkeys([
+            question,
+            *queries,
+            f"{question} authoritative sources evidence",
+        ]))
+        workers = max(1, min(len(broader_queries), int(self.cfg.web_fetch_workers)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self._web_scrape_chunks, query) for query in broader_queries]
+            web_chunks = [chunk for future in futures for chunk in future.result()]
+
+        candidates = []
+        seen = set()
+        for chunk in [*chunks, *web_chunks]:
+            key = f"{chunk.get('source_type', 'pdf')}:{chunk.get('chroma_id') or chunk.get('source_url', chunk.get('filename', ''))}:{chunk.get('text', '')[:100]}"
+            if key not in seen:
+                seen.add(key)
+                candidates.append(chunk)
+        reranked = self.reranker.rerank_queries(
+            broader_queries,
+            candidates,
+            max(limit * 2, limit + 2),
+            self.cfg.min_rerank_score,
+        )
+        pdf_winners = [chunk for chunk in reranked
+                       if chunk.get("source_type") != "web" and chunk.get("parent_id")]
+        web_winners = [chunk for chunk in reranked
+                       if chunk.get("source_type") == "web" or not chunk.get("parent_id")]
+        expanded_pdf = self.retriever.expand_to_context(pdf_winners)
+        recovered = sorted(
+            expanded_pdf + web_winners,
+            key=lambda chunk: chunk.get("rerank_score", 0.0),
+            reverse=True,
+        )
+        return self._diversify_sources(recovered, query_type, limit)
 
     def __init__(self, cfg: RAGConfig) -> None:
         self.cfg = cfg
@@ -233,23 +422,38 @@ class ProductionRAGPipeline:
         trace = QueryTrace(query_text=question)
         log.info("\n[Query] '%s'", question[:80])
         query_emb = self._embed_query(question)
-        cached = self.cache.get_answer(question, query_emb)
+        query_type = self._classify_query(question)
+        rewrite_id, rewritten_queries = self.rewriter.rewrite_queries(question)
+        retrieval_plan = self._route_query(question, query_type, rewritten_queries)
+        retrieval_queries = retrieval_plan["queries"]
+        log.info("[Query] Route=%s | retrieval_queries=%d | top_k=%d | web=%s",
+             query_type, len(retrieval_queries), retrieval_plan["top_k"],
+             retrieval_plan["always_web"])
+        rewritten = "\n".join(retrieval_queries)
+        trace.t_rewrite = time.time()
+        trace.rewritten_query = rewritten
+        answer_cache_key = (
+            f"question={question}\nrewritten_query={rewritten}\n"
+            f"retrieval_cache_schema_version={self.cfg.retrieval_cache_schema_version}\n"
+            f"critic_config_version={self.cfg.critic_config_version}"
+        )
+        cached = self.cache.get_answer(
+            question, query_emb, cache_key=answer_cache_key, include_metadata=True
+        )
         if cached:
-            answer, sources = cached
+            answer, sources, critic_metadata = cached
             trace.answer_cache_hit = True
             trace.t_end = time.time()
             self.metrics.record(trace)
-            return {"answer": answer, "sources": sources, "query_id": trace.query_id,
-                    "rewrite_id": None, "rewritten_query": question, "from_cache": True,
+            return {"answer": answer, "sources": sources, "critic": critic_metadata,
+                    "query_id": trace.query_id, "rewrite_id": rewrite_id,
+                    "rewritten_query": rewritten, "from_cache": True,
                     "drift_alert": None,
                     "metrics": {"answer_cache_hit": True, "total_ms": trace.total_ms()}}
-
-        rewrite_id, rewritten = self.rewriter.rewrite(question)
-        trace.t_rewrite = time.time()
-        trace.rewritten_query = rewritten
         cached_chunks = self.cache.get_retrieval(rewritten)
         bm25_ids: set = set()
         dense_ids: set = set()
+        web_scrape_used = False
 
         if cached_chunks:
             chunks = cached_chunks
@@ -259,17 +463,27 @@ class ProductionRAGPipeline:
             log.info("[Query] Starting PDF + web retrieval...")
             outer_workers = max(2, int(self.cfg.web_fetch_workers) + 1)
             with ThreadPoolExecutor(max_workers=outer_workers) as pool:
-                pdf_fut = pool.submit(self.retriever.retrieve_candidates, rewritten, metadata_filter)
-                web_fut = (pool.submit(self._web_scrape_chunks, rewritten)
-                           if use_web_fallback and self.cfg.always_scrape_web else None)
-                pdf_candidates, bm25_ids, dense_ids = pdf_fut.result()
-                web_chunks = web_fut.result() if web_fut else []
-            trace.t_retrieval = time.time()
+                pdf_futures = {
+                    pool.submit(self.retriever.retrieve_candidates, query, metadata_filter): query
+                    for query in retrieval_queries
+                }
+                web_futures = ({
+                    pool.submit(self._web_scrape_chunks, query): query
+                    for query in retrieval_queries
+                } if use_web_fallback and retrieval_plan["always_web"] else {})
+                pdf_results = [future.result() for future in pdf_futures]
+                web_results = [future.result() for future in web_futures]
 
-            if use_web_fallback and not self.cfg.always_scrape_web and not web_chunks:
-                top_pdf_score = pdf_candidates[0].get("rrf_score", 0.0) if pdf_candidates else 0.0
-                if top_pdf_score < self.cfg.min_retrieval_score:
-                    web_chunks = self._web_scrape_chunks(rewritten)
+            pdf_candidates = []
+            bm25_ids = set()
+            dense_ids = set()
+            for candidates, query_bm25_ids, query_dense_ids in pdf_results:
+                pdf_candidates.extend(candidates)
+                bm25_ids.update(query_bm25_ids)
+                dense_ids.update(query_dense_ids)
+            web_chunks = [chunk for results in web_results for chunk in results]
+            web_scrape_used = bool(web_futures)
+            trace.t_retrieval = time.time()
 
             seen = set()
             all_candidates = []
@@ -278,7 +492,7 @@ class ProductionRAGPipeline:
                 if key not in seen:
                     seen.add(key)
                     all_candidates.append(candidate)
-            for chunk in web_chunks[:self.cfg.web_top_k]:
+            for chunk in web_chunks:
                 key = f"web:{chunk.get('source_url', chunk.get('filename', ''))}:{chunk.get('text', '')[:100]}"
                 if key not in seen:
                     seen.add(key)
@@ -287,18 +501,36 @@ class ProductionRAGPipeline:
             log.info("[Query] Merged candidates: %d PDF + %d web = %d total",
                      len(pdf_candidates), len(web_chunks), len(all_candidates))
             # One and only one cross-encoder pass after PDF/web fusion.
-            chunks = self.reranker.rerank(
-                rewritten, all_candidates, self.cfg.top_k_rerank, self.cfg.min_rerank_score
+            chunks = self.reranker.rerank_queries(
+                retrieval_queries, all_candidates, retrieval_plan["candidate_k"], self.cfg.min_rerank_score
             )
             pdf_winners = [c for c in chunks if c.get("source_type") != "web" and c.get("parent_id")]
             web_winners = [c for c in chunks if c.get("source_type") == "web" or not c.get("parent_id")]
             expanded_pdf = self.retriever.expand_to_context(pdf_winners)
             chunks = sorted(expanded_pdf + web_winners,
-                            key=lambda c: c.get("rerank_score", 0.0), reverse=True)[:self.cfg.top_k_rerank]
+                            key=lambda c: c.get("rerank_score", 0.0), reverse=True)
+            chunks = self._diversify_sources(chunks, query_type, retrieval_plan["top_k"])
             trace.t_rerank = time.time()
+
+            if use_web_fallback and not retrieval_plan["always_web"] and not self._is_answerable(chunks):
+                log.info("[Query] Local sources failed answerability; using web fallback")
+                chunks = self._broader_web_retrieval(
+                    question,
+                    retrieval_queries,
+                    chunks,
+                    query_type,
+                    retrieval_plan["top_k"],
+                )
+                web_scrape_used = True
+                trace.t_retrieval = time.time()
+                trace.t_rerank = time.time()
+
             safe_chunks = [{k: v for k, v in c.items()
-                            if isinstance(v, (str, int, float, bool, type(None)))} for c in chunks]
-            self.cache.set_retrieval(rewritten, safe_chunks)
+                            if isinstance(v, (str, int, float, bool, type(None), list))} for c in chunks]
+            if self._is_answerable(chunks):
+                self.cache.set_retrieval(rewritten, safe_chunks)
+            else:
+                log.info("[Cache] Skipping weak retrieval result")
 
         scores = [c.get("rerank_score", 0.0) for c in chunks if "rerank_score" in c]
         trace.num_chunks_retrieved = len(chunks)
@@ -306,24 +538,103 @@ class ProductionRAGPipeline:
         trace.top_rerank_score = max(scores) if scores else 0.0
         trace.bm25_overlap = len(bm25_ids & dense_ids)
 
-        context = self._format_context(chunks)
-        log.info("[Query] Generating answer over %d chunks...", len(chunks))
-        answer = self._rag_chain.invoke({"context": context, "question": rewritten}).strip()
-        trace.t_generation = time.time()
+        answerable = self._is_answerable(chunks)
+        low_confidence = (
+            trace.top_rerank_score < self.cfg.answerability_min_top_score
+            or trace.mean_rerank_score < self.cfg.answerability_min_mean_score
+        )
+        require_web = low_confidence and self.cfg.low_confidence_requires_web
+        if (not answerable or require_web) and use_web_fallback and not web_scrape_used:
+            log.info("[Query] %s; broadening web retrieval",
+                     "Low confidence requires web evidence" if require_web
+                     else "Answerability gate failed")
+            chunks = self._broader_web_retrieval(
+                question,
+                retrieval_queries,
+                chunks,
+                query_type,
+                retrieval_plan["top_k"],
+            )
+            trace.t_retrieval = time.time()
+            scores = [c.get("rerank_score", 0.0) for c in chunks if "rerank_score" in c]
+            answerable = self._is_answerable(chunks)
+            trace.num_chunks_retrieved = len(chunks)
+            trace.mean_rerank_score = round(sum(scores) / len(scores), 4) if scores else 0.0
+            trace.top_rerank_score = max(scores) if scores else 0.0
+            trace.t_rerank = time.time()
+            web_scrape_used = True
 
-        verdict, issues, faith_score = self.critic.check(rewritten, context, answer)
+        context = self._format_context(chunks)
+        if answerable:
+            log.info("[Query] Generating answer over %d chunks...", len(chunks))
+            answer = self._rag_chain.invoke({"context": context, "question": question}).strip()
+        else:
+            log.warning("[Query] Answerability gate failed; returning insufficient-information response")
+            answer = self._insufficient_information_response(question)
+        generated_answer = answer
+        trace.t_generation = time.time()
+        log.info("[Query] Web scrape used: %s", web_scrape_used)
+
+        critic_result = {
+            "verdict": "PASS", "severity": "none", "critique": "",
+        }
+        repair_mode = "critic_disabled"
+        repair_attempts = 0
+        if self.cfg.critic_enabled:
+            critic_result = self.critic.evaluate(question, answer, context)
+            repair_mode = "none"
+            max_attempts = max(0, int(self.cfg.critic_max_repair_attempts))
+            for attempt in range(max_attempts + 1):
+                if critic_result["verdict"] == "PASS":
+                    break
+                if critic_result["verdict"] == "UNCERTAIN" or attempt >= max_attempts:
+                    if critic_result["verdict"] == "HALLUCINATED" and self.cfg.critic_abstain_on_failed_repair:
+                        answer = self._insufficient_information_response(question)
+                        repair_mode = "abstain"
+                    break
+                repaired, repair_mode = self._repair_answer(question, answer, critic_result, context)
+                repair_attempts += 1
+                if repaired is None:
+                    answer = self._insufficient_information_response(question)
+                    repair_mode = "abstain"
+                    break
+                answer = repaired
+                critic_result = (
+                    self.critic.evaluate(question, answer, context)
+                    if self.cfg.critic_require_context_grounding
+                    else {"verdict": "PASS", "severity": "none", "critique": ""}
+                )
+            log.info("[Query] Critic verdict=%s severity=%s repair_mode=%s",
+                     critic_result["verdict"], critic_result.get("severity"), repair_mode)
+
         critic_details = dict(self.critic.last_details)
-        log.info("[Query] Critic: %s | score=%.2f | grounded=%s | complete=%s | relevant=%s",
-                 verdict, faith_score, critic_details.get("groundedness", "?"),
-                 critic_details.get("completeness", "?"), critic_details.get("relevance", "?"))
-        if verdict == "HALLUCINATED":
-            answer = self.critic.repair(rewritten, context, answer, issues)
-            log.info("[Query] Surgical repair applied")
-        answer = self.critic.polish(answer)
+        faith_score = 1.0 if critic_result["verdict"] == "PASS" else 0.0
+        if self.cfg.critic_enabled and self.cfg.critic_polish_enabled:
+            answer = self.critic.polish(answer)
+        validated = self.cfg.critic_enabled and critic_result["verdict"] == "PASS"
+        critic_metadata = {
+            "initial_answer": generated_answer,
+            "final_answer": answer,
+            "verdict": critic_result["verdict"],
+            "severity": critic_result.get("severity", "none"),
+            "repair_mode": repair_mode,
+            "repair_attempts": repair_attempts,
+            "validated": validated,
+        }
         trace.answer_faithfulness = faith_score
 
         sources = [self._source_provenance(c, i) for i, c in enumerate(chunks, 1)]
-        self.cache.set_answer(question, query_emb, answer, sources)
+        if validated:
+            self.cache.set_answer(
+                question,
+                query_emb,
+                answer,
+                sources,
+                cache_key=answer_cache_key,
+                metadata=critic_metadata,
+            )
+        else:
+            log.info("[Cache] Skipping answer cache; critic validation=%s", validated)
         trace.t_end = time.time()
         self.metrics.record(trace)
         self.rewriter.record_answer_score(rewrite_id, faith_score)
@@ -336,7 +647,8 @@ class ProductionRAGPipeline:
         drift_alert = self.metrics.check_drift() if self._query_count % self.cfg.drift_window == 0 else None
         log.info("[Query] Done in %.0fms", trace.total_ms())
         return {
-            "answer": answer, "sources": sources, "query_id": trace.query_id,
+            "answer": answer, "sources": sources, "critic": critic_metadata,
+            "query_id": trace.query_id,
             "rewrite_id": rewrite_id, "rewritten_query": rewritten, "from_cache": False,
             "drift_alert": drift_alert,
             "metrics": {
@@ -352,6 +664,10 @@ class ProductionRAGPipeline:
                 "critic_relevance": critic_details.get("relevance", "UNKNOWN"),
                 "chunks_used": len(chunks), "bm25_overlap": trace.bm25_overlap,
                 "retrieval_cached": trace.retrieval_cache_hit,
+                "query_type": query_type,
+                "answerable": answerable,
+                "low_confidence": low_confidence,
+                "web_scrape_used": web_scrape_used,
             },
         }
 
@@ -407,6 +723,15 @@ class ProductionRAGPipeline:
                 "url": url, "domain": parsed.hostname or "", "page": None,
                 "section": None, "filename": None,
                 "retrieved_at": chunk.get("scraped_at"),
+                "domain_score": chunk.get("domain_score"),
+                "domain_score_reasons": chunk.get("domain_score_reasons", []),
+                "page_quality_score": chunk.get("page_quality_score"),
+                "retrieval_score": chunk.get("retrieval_score", chunk.get("rerank_score")),
+                "query_relevance": chunk.get("query_relevance"),
+                "http_status": chunk.get("http_status"),
+                "redirect_count": chunk.get("redirect_count"),
+                "final_url": chunk.get("final_url") or url,
+                "meaningful_paragraphs": chunk.get("meaningful_paragraphs"),
                 "rerank_score": round(chunk.get("rerank_score", 0.0), 3),
             }
         return {
@@ -434,7 +759,11 @@ class ProductionRAGPipeline:
                 log.warning("[WebScrape] DDG attempt %d failed: %s", attempt + 1, exc)
                 time.sleep(2 ** attempt)
 
-        approved = _select_web_results(raw, self.cfg.max_scrape_urls)
+        approved = _select_web_results(
+            raw,
+            self.cfg.max_scrape_urls,
+            self.cfg.min_domain_score,
+        )
         # new_chunks = 0
         # for result in approved:
         #     original_url = result["href"]
@@ -463,10 +792,10 @@ class ProductionRAGPipeline:
             if self.cfg.url_evaluator_enabled:
                 decision = evaluate_url(
                     original_url,
-                    min_domain_score=self.cfg.url_evaluator_min_domain_score,
+                    min_domain_score=self.cfg.min_domain_score,
                 )
 
-                if not decision["approved"]:
+                if not decision["allowed"]:
                     rejected_urls += 1
                     log.info(
                         "[WebScrape] URL rejected before fetch: %s | reason=%s",
@@ -501,7 +830,8 @@ class ProductionRAGPipeline:
 
         with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
             futures = {
-                pool.submit(self._fetch_verified_url, result["href"]): result
+                pool.submit(self._fetch_verified_url, result["href"], query,
+                            result.get("domain_score", 0)): result
                 for result in candidates
             }
 
@@ -522,9 +852,16 @@ class ProductionRAGPipeline:
 
         # Persist sequentially unless WebChunkStore is explicitly thread-safe.
         new_chunks = 0
+        seen_content = set()
 
         for result, fetched in fetched_results:
-            canonical_url, title, text = fetched
+            canonical_url, title, text, page_metadata = fetched
+
+            content_hash = hashlib.sha256(re.sub(r"\s+", " ", text.lower()).encode()).hexdigest()
+            if content_hash in seen_content:
+                log.info("[WebScrape] Skipping duplicate page content: %s", canonical_url)
+                continue
+            seen_content.add(content_hash)
 
             if self.web_store.is_fresh(canonical_url):
                 continue
@@ -533,6 +870,11 @@ class ProductionRAGPipeline:
                 canonical_url,
                 title or result.get("title", "Web"),
                 text,
+                metadata={
+                    "domain_score": result.get("domain_score"),
+                    "domain_score_reasons": result.get("domain_score_reasons", []),
+                    **page_metadata,
+                },
             )
 
         log.info(
@@ -544,17 +886,18 @@ class ProductionRAGPipeline:
 
         return self.web_store.search(query, k=self.cfg.web_top_k)
 
-    def _fetch_verified_url(self, url: str, char_limit: int = 2500):
+    def _fetch_verified_url(self, url: str, query: str = "", domain_score: float = 0.0,
+                            char_limit: int = 2500):
         # normalized = _normalize_url(url)
         # if not normalized:
         #     return None
         if self.cfg.url_evaluator_enabled:
             decision = evaluate_url(
                 url,
-                min_domain_score=self.cfg.url_evaluator_min_domain_score,
+                min_domain_score=self.cfg.min_domain_score,
             )
 
-            if not decision["approved"]:
+            if not decision["allowed"]:
                 log.info(
                     "[WebScrape] Fetch blocked by URL evaluator: %s | reason=%s",
                     url,
@@ -595,10 +938,10 @@ class ProductionRAGPipeline:
                         if self.cfg.url_evaluator_enabled:
                             redirect_decision = evaluate_url(
                                 next_url,
-                                min_domain_score=self.cfg.url_evaluator_min_domain_score,
+                                min_domain_score=self.cfg.min_domain_score,
                             )
 
-                            if not redirect_decision["approved"]:
+                            if not redirect_decision["allowed"]:
                                 log.warning(
                                     "[WebScrape] Rejected unsafe redirect: %s -> %s | reason=%s",
                                     current_url,
@@ -644,7 +987,18 @@ class ProductionRAGPipeline:
                     title = title_tag.get_text(" ", strip=True) if title_tag else ""
                     if len(text) > char_limit:
                         text = text[:char_limit] + "\n[truncated]"
-                    return final_url, title, text
+                    paragraphs = [paragraph for paragraph in text.splitlines() if len(paragraph.split()) >= 5]
+                    page_quality, query_relevance = self._page_quality(
+                        text, title, query, domain_score, len(paragraphs)
+                    )
+                    return final_url, title, text, {
+                        "page_quality_score": page_quality,
+                        "query_relevance": query_relevance,
+                        "http_status": resp.status_code,
+                        "redirect_count": _hop,
+                        "final_url": final_url,
+                        "meaningful_paragraphs": len(paragraphs),
+                    }
                 # log.warning("[WebScrape] Rejected redirect chain exceeding 5 hops: %s", normalized)
                 log.warning(
                     "[WebScrape] Rejected redirect chain exceeding %d hops: %s",

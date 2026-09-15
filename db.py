@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS answer_cache (
     query_embedding BLOB NOT NULL,
     answer TEXT NOT NULL,
     sources_json TEXT DEFAULT '[]',
+    answer_metadata_json TEXT DEFAULT '{}',
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL,
     hit_count INTEGER DEFAULT 0
@@ -141,6 +142,9 @@ class Database:
                     conn.execute(statement)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(chunk_type)")
+            answer_columns = {r["name"] for r in conn.execute("PRAGMA table_info(answer_cache)").fetchall()}
+            if "answer_metadata_json" not in answer_columns:
+                conn.execute("ALTER TABLE answer_cache ADD COLUMN answer_metadata_json TEXT DEFAULT '{}'")
 
     @contextmanager
     def connect(self) -> Generator[sqlite3.Connection, None, None]:

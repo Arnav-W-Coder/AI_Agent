@@ -64,13 +64,13 @@ class WebChunkStore:
                    preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items)
         return fresh
 
-    def upsert(self, url: str, title: str, text: str) -> int:
-        return self.upsert_batch([(url, title, text)])
+    def upsert(self, url: str, title: str, text: str, metadata: dict | None = None) -> int:
+        return self.upsert_batch([(url, title, text, metadata or {})])
 
-    def upsert_batch(self, pages: list[tuple[str, str, str]]) -> int:
+    def upsert_batch(self, pages: list[tuple[str, str, str, dict]]) -> int:
         """Embed and persist multiple pages in batches instead of one request per page."""
         pending = []
-        for url, title, text in pages:
+        for url, title, text, metadata in pages:
             if self.is_fresh(url):
                 log.info("[WebStore] Cache hit — skipping re-embed: %s", url[:70])
                 continue
@@ -78,7 +78,7 @@ class WebChunkStore:
                 continue
             docs = self._splitter.create_documents([text])
             for doc in docs:
-                pending.append((url, title, doc.page_content))
+                pending.append((url, title, doc.page_content, metadata))
 
         if not pending:
             return 0
@@ -92,7 +92,15 @@ class WebChunkStore:
             "source": url, "source_url": url,
             "domain": urlsplit(url).hostname or "", "title": title,
             "source_type": "web", "scraped_at": now, "expires_at": expires_at,
-        } for url, title, _ in pending]
+            "domain_score": metadata.get("domain_score", 0),
+            "domain_score_reasons": json.dumps(metadata.get("domain_score_reasons", [])),
+            "page_quality_score": metadata.get("page_quality_score", 0.0),
+            "query_relevance": metadata.get("query_relevance", 0.0),
+            "http_status": metadata.get("http_status", 0),
+            "redirect_count": metadata.get("redirect_count", 0),
+            "final_url": metadata.get("final_url", url),
+            "meaningful_paragraphs": metadata.get("meaningful_paragraphs", 0),
+        } for url, title, _, metadata in pending]
 
         embeddings_list = []
         batch_size = max(1, int(self.cfg.web_embed_batch_size))
@@ -117,7 +125,7 @@ class WebChunkStore:
             return 0
 
         by_url = {}
-        for chunk_id, (url, title, _) in zip(chunk_ids, pending):
+        for chunk_id, (url, title, _, _) in zip(chunk_ids, pending):
             by_url.setdefault((url, title), []).append(chunk_id)
         with self.db.connect() as conn:
             for (url, title), ids in by_url.items():
@@ -154,6 +162,15 @@ class WebChunkStore:
             "domain": (meta or {}).get("domain", ""), "page_number": 0,
             "rerank_score": round(float(1 - distance), 3), "source_type": "web",
             "title": (meta or {}).get("title", ""), "scraped_at": (meta or {}).get("scraped_at"),
+            "domain_score": (meta or {}).get("domain_score"),
+            "domain_score_reasons": json.loads((meta or {}).get("domain_score_reasons", "[]")),
+            "page_quality_score": (meta or {}).get("page_quality_score", 0.0),
+            "query_relevance": (meta or {}).get("query_relevance", 0.0),
+            "retrieval_score": round(float(1 - distance), 3),
+            "http_status": (meta or {}).get("http_status"),
+            "redirect_count": (meta or {}).get("redirect_count"),
+            "final_url": (meta or {}).get("final_url", ""),
+            "meaningful_paragraphs": (meta or {}).get("meaningful_paragraphs", 0),
         } for cid, text, meta, distance in zip(ids, docs, metas, distances)]
         checkpoint("web_store.search_output", output, enabled=self.cfg.debug_checkpoints,
                    preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,

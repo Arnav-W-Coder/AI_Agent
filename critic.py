@@ -3,7 +3,7 @@ critic.py — Multi-dimensional RAG quality control and bounded repair.
 """
 import logging
 import re
-from typing import Optional, TYPE_CHECKING
+from typing import Literal, Optional, TYPE_CHECKING, TypedDict
 
 from langchain_ollama import ChatOllama
 
@@ -89,6 +89,32 @@ Rules:
 I don't have enough information to answer this confidently.
 """)
 
+_DESTRUCTIVE_REPAIR_PROMPT = ChatPromptTemplate.from_template("""
+Regenerate an answer after a hallucination was detected. Use ONLY the
+retrieved context and the original question.
+
+You may completely restructure the previous answer, but every factual
+statement must be directly supported by the context. Do not use outside
+knowledge or preserve unsupported claims. If the context is insufficient,
+return exactly: I don't have enough information to answer this confidently.
+
+Original question: {question}
+Previous answer: {answer}
+Critic findings: {issues}
+Retrieved context: {context}
+
+Return only the answer.
+""")
+
+
+class CriticResult(TypedDict):
+    verdict: Literal["PASS", "HALLUCINATED", "UNCERTAIN"]
+    severity: Literal["none", "minor", "major"]
+    unsupported_claims: list[str]
+    repairable: bool
+    critique: str
+    repaired_answer: str | None
+
 
 class CriticAndRepair:
     """Multi-dimensional evaluation with one bounded repair pass."""
@@ -96,6 +122,7 @@ class CriticAndRepair:
     def __init__(self, llm: ChatOllama, cfg: Optional["RAGConfig"] = None) -> None:
         self._critic_chain = _CRITIC_PROMPT | llm | StrOutputParser()
         self._repair_chain = _REPAIR_PROMPT | llm | StrOutputParser()
+        self._destructive_repair_chain = _DESTRUCTIVE_REPAIR_PROMPT | llm | StrOutputParser()
         self._cfg = cfg
         self.last_details: dict = {}
 
@@ -108,38 +135,59 @@ class CriticAndRepair:
         else:
             raise TypeError("check() expects (question, context, answer) or (context, answer)")
 
-        checkpoint("critic.input", {
-            "question": question,
-            "context": context,
-            "answer": answer,
-        }, enabled=getattr(self._cfg, "debug_checkpoints", True),
+        result = self.evaluate(question, answer, context)
+        score = 1.0 if result["verdict"] == "PASS" else 0.0
+        legacy_verdict = "GROUNDED" if result["verdict"] == "PASS" else result["verdict"]
+        return legacy_verdict, result["critique"], score
+
+    def evaluate(self, question: str, answer: str, context: str) -> CriticResult:
+        checkpoint("critic.input", {"question": question, "context": context, "answer": answer},
+                   enabled=getattr(self._cfg, "debug_checkpoints", True),
                    preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
                    sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
-
         if not context or not context.strip():
-            log.info("[Critic] No context — FAIL")
-            self.last_details = {"groundedness": "FAIL", "completeness": "FAIL", "relevance": "FAIL"}
-            return "HALLUCINATED", "- No retrieval context was provided.", 0.0
-
+            return self._result("HALLUCINATED", "major", "No retrieval context was provided.", False)
         if self._is_uncertainty_response(answer):
-            self.last_details = {"groundedness": "PASS", "completeness": "PASS", "relevance": "PASS"}
-            return "GROUNDED", "", 1.0
+            return self._result("PASS", "none", "", True)
+        try:
+            raw = self._critic_chain.invoke({
+                "question": question or "Determine whether the answer is supported by the retrieved context.",
+                "context": context,
+                "answer": answer,
+            }).strip()
+            result = self._parse_critic_output(raw)
+            checkpoint("critic.evaluation", result, enabled=getattr(self._cfg, "debug_checkpoints", True),
+                       preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
+                       sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
+            return result
+        except Exception as exc:
+            log.warning("[Critic] Evaluation failed: %s", exc)
+            return self._result("UNCERTAIN", "none", f"Critic evaluation failed: {exc}", False)
 
-        raw = self._critic_chain.invoke({
-            "question": question or "Determine whether the answer is supported by the retrieved context.",
-            "context": context,
-            "answer": answer,
-        }).strip()
-        checkpoint("critic.raw_output", raw, enabled=getattr(self._cfg, "debug_checkpoints", True),
-                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
-                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
-        result = self._parse_critic_output(raw)
-        checkpoint("critic.evaluation", {
-            "verdict": result[0], "issues": result[1], "score": result[2], **self.last_details,
-        }, enabled=getattr(self._cfg, "debug_checkpoints", True),
-                   preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
-                   sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
-        return result
+    def repair_constrained(self, question: str, context: str, answer: str,
+                           critique: str) -> str | None:
+        return self._run_repair(self._repair_chain, question, context, answer, critique)
+
+    def repair_destructive(self, question: str, context: str, answer: str,
+                           critique: str) -> str | None:
+        return self._run_repair(self._destructive_repair_chain, question, context, answer, critique)
+
+    def _run_repair(self, chain, question: str, context: str, answer: str, critique: str) -> str | None:
+        try:
+            repaired = chain.invoke({"question": question, "context": context,
+                                     "answer": answer, "issues": critique}).strip()
+            repaired = self._strip_meta_commentary(repaired)
+            return repaired if len(repaired) >= 5 else None
+        except Exception as exc:
+            log.warning("[Repair] Failed: %s", exc)
+            return None
+
+    def _result(self, verdict: Literal["PASS", "HALLUCINATED", "UNCERTAIN"],
+                severity: Literal["none", "minor", "major"], critique: str,
+                repairable: bool) -> CriticResult:
+        self.last_details = {"groundedness": "PASS" if verdict == "PASS" else "FAIL"}
+        return {"verdict": verdict, "severity": severity, "unsupported_claims": [critique] if critique else [],
+                "repairable": repairable, "critique": critique, "repaired_answer": None}
 
     def repair(self, *args) -> str:
         if len(args) == 4:
@@ -204,7 +252,7 @@ class CriticAndRepair:
         threshold = getattr(self._cfg, "critic_uncertainty_threshold", 0.50)
         return uncertainty_count / len(sentences) >= threshold
 
-    def _parse_critic_output(self, raw: str) -> tuple[str, str, float]:
+    def _parse_critic_output(self, raw: str) -> CriticResult:
         def field(name: str, default: str = "FAIL") -> str:
             match = re.search(rf"^{name}:\s*(PASS|FAIL)\b", raw, flags=re.IGNORECASE | re.MULTILINE)
             return match.group(1).upper() if match else default
@@ -219,8 +267,20 @@ class CriticAndRepair:
             issues = ""
         self.last_details = {"groundedness": groundedness, "completeness": completeness, "relevance": relevance}
         failed = [value for value in self.last_details.values() if value == "FAIL"]
-        verdict = "GROUNDED" if not failed else "HALLUCINATED"
-        return verdict, issues, round(max(0.0, min(1.0, score)), 2)
+        if not failed:
+            verdict: Literal["PASS", "HALLUCINATED", "UNCERTAIN"] = "PASS"
+            severity: Literal["none", "minor", "major"] = "none"
+        else:
+            verdict = "HALLUCINATED"
+            severity = "major" if groundedness == "FAIL" else "minor"
+        return {
+            "verdict": verdict,
+            "severity": severity,
+            "unsupported_claims": [line.strip("- ") for line in issues.splitlines() if line.strip()],
+            "repairable": bool(issues),
+            "critique": issues,
+            "repaired_answer": None,
+        }
 
     @staticmethod
     def _strip_meta_commentary(answer: str) -> str:
