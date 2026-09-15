@@ -101,6 +101,12 @@ class CrossEncoderReranker:
         """Rerank the multi-query candidate union against the original question."""
         return self.rerank(original_question, chunks, top_k, min_score)
 
+    def rerank_queries(self, queries: list[str], chunks: list[dict], top_k: int,
+                       min_score: float) -> list[dict]:
+        """Compatibility wrapper; callers should pass the original question."""
+        original_question = next((query.strip() for query in queries if query.strip()), "")
+        return self.rerank_against_original(original_question, chunks, top_k, min_score)
+
 
 class HybridRetriever:
     def __init__(self, vectorstore: Chroma, bm25_index: BM25Index,
@@ -219,8 +225,16 @@ class HybridRetriever:
                 words = text.split()
                 text = " ".join(words[:budget])
                 tokens = _token_count(text)
-            selected.append({**child, "text": text, "chunk_type": "parent_context", "parent_id": pid,
-                             "page_number": parent["page_number"], "end_page": parent["end_page"], "section_path": parent["section_path"]})
+            selected.append({
+                **child,
+                "text": text,
+                "chunk_type": "parent_context",
+                "parent_id": pid,
+                "page_number": parent["page_number"],
+                "end_page": parent["end_page"],
+                "section_path": parent["section_path"],
+                "original_rerank_score": child.get("rerank_score"),
+            })
             used += tokens
             seen.add(pid)
         for neighbor in neighbors:
@@ -233,7 +247,7 @@ class HybridRetriever:
                 continue
             selected.append({"text": text, "filename": neighbor.get("filename", ""), "page_number": neighbor["page_number"],
                              "end_page": neighbor["end_page"], "section_path": neighbor["section_path"], "doc_id": neighbor["doc_id"],
-                             "parent_id": nid, "chunk_type": "neighbor_context", "rerank_score": 0.0, "rrf_score": 0.0})
+                             "parent_id": nid, "chunk_type": "neighbor_context", "context_only": True})
             used += tokens
             seen.add(nid)
         result = selected or children

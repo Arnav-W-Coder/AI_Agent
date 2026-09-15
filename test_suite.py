@@ -885,6 +885,45 @@ class TestOriginalQuestionReranking:
         ]
         assert results[0]["text"] == "strong evidence"
 
+    @pytest.mark.layer1
+    def test_answerability_rejects_keyword_mismatch(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        pipeline = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        pipeline.cfg = cfg
+        cfg.answerability_min_chunks = 2
+        cfg.answerability_min_top_score = -8.0
+        cfg.answerability_min_mean_score = -8.0
+        chunks = [
+            {"text": "RAG retrieves documents and generates answers.", "rerank_score": -2.0},
+            {"text": "Vector search ranks text chunks.", "rerank_score": -2.5},
+        ]
+        assert pipeline._is_answerable(chunks, "explain multimodal rag") is False
+
+    @pytest.mark.layer1
+    def test_context_expansion_preserves_original_rerank_score(self, db, cfg):
+        from retrieval import HybridRetriever
+        import uuid
+
+        doc_id = _insert_doc(db, "evidence.pdf")
+        parent_id = str(uuid.uuid4())
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO chunks "
+                "(id, doc_id, chroma_id, chunk_index, page_number, text_preview, text, chunk_type, parent_id, end_page, section_path) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (parent_id, doc_id, "", -1, 1, "Evidence", "Evidence parent", "parent", None, 1, "Section"),
+            )
+        cfg.context_neighbor_count = 0
+        retriever = HybridRetriever.__new__(HybridRetriever)
+        retriever.db = db
+        retriever.cfg = cfg
+        expanded = retriever.expand_to_context([{
+            "text": "Evidence child", "parent_id": parent_id,
+            "filename": "evidence.pdf", "rerank_score": -2.3131,
+        }])
+        assert expanded[0]["rerank_score"] == -2.3131
+        assert expanded[0]["original_rerank_score"] == -2.3131
+
 
 # ── Rewriter SQLite helpers (no langchain imports) ────────────────────────────
 

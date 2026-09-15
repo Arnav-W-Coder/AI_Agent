@@ -295,17 +295,69 @@ class ProductionRAGPipeline:
 
         return selected
 
-    def _is_answerable(self, chunks: list[dict]) -> bool:
+    @staticmethod
+    def _query_evidence_terms(question: str) -> set[str]:
+        stop_words = {
+            "a", "an", "and", "are", "be", "does", "do", "for", "how",
+            "is", "me", "of", "please", "the", "to", "what", "which",
+        }
+        return {
+            term for term in re.findall(r"[a-z0-9]+", question.lower())
+            if len(term) > 2 and term not in stop_words
+        }
+
+    def _has_query_evidence(self, question: str, chunks: list[dict]) -> bool:
+        terms = self._query_evidence_terms(question)
+        if not terms:
+            return bool(chunks)
+        evidence = " ".join(
+            str(chunk.get("text", chunk.get("text_preview", ""))).lower()
+            for chunk in chunks
+            if not chunk.get("context_only")
+        )
+        coverage = sum(term in evidence for term in terms) / len(terms)
+        return coverage >= self.cfg.answerability_min_query_term_coverage
+
+    def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
         scores = [
             float(chunk.get("rerank_score", 0.0))
             for chunk in chunks
-            if "rerank_score" in chunk
+            if "rerank_score" in chunk and not chunk.get("context_only")
         ]
         if len(chunks) < self.cfg.answerability_min_chunks or not scores:
             return False
-        return (
+        scoreable = (
             max(scores) >= self.cfg.answerability_min_top_score
             and sum(scores) / len(scores) >= self.cfg.answerability_min_mean_score
+        )
+        return scoreable and (not question or self._has_query_evidence(question, chunks))
+
+    @staticmethod
+    def _retrieval_debug_summary(question: str, rewritten_queries: list[str],
+                                 retrieval_calls: list[dict], unique_candidates: int,
+                                 chunks: list[dict], answerable: bool,
+                                 web_fallback: bool) -> str:
+        scores = [
+            chunk.get("rerank_score") for chunk in chunks
+            if chunk.get("rerank_score") is not None and not chunk.get("context_only")
+        ]
+        top_scores = sorted((float(score) for score in scores), reverse=True)[:5]
+        filenames = [
+            Path(str(chunk.get("filename", "unknown"))).name
+            for chunk in chunks[:5]
+            if chunk.get("filename")
+        ]
+        return (
+            "Retrieval debug summary | "
+            f"Original question: {question!r} | "
+            f"Rewritten queries: {rewritten_queries!r} | "
+            f"Retrieval calls: {retrieval_calls!r} | "
+            f"Candidates per query: {[call.get('candidates', 0) for call in retrieval_calls]!r} | "
+            f"Unique candidates: {unique_candidates} | "
+            f"Top original-question scores: {top_scores!r} | "
+            f"Top source filenames: {filenames!r} | "
+            f"Answerability decision: {answerable} | "
+            f"Web fallback decision: {web_fallback}"
         )
 
     @staticmethod
@@ -496,6 +548,8 @@ class ProductionRAGPipeline:
         bm25_ids: set = set()
         dense_ids: set = set()
         web_scrape_used = False
+        retrieval_calls: list[dict] = []
+        unique_candidate_count = len(cached_chunks or [])
 
         if cached_chunks:
             chunks = cached_chunks
@@ -515,6 +569,16 @@ class ProductionRAGPipeline:
                 } if use_web_fallback and retrieval_plan["always_web"] else {})
                 pdf_results = [future.result() for future in pdf_futures]
                 web_results = [future.result() for future in web_futures]
+
+                for index, query in enumerate(retrieval_queries):
+                    pdf_count = len(pdf_results[index][0]) if index < len(pdf_results) else 0
+                    web_count = len(web_results[index]) if index < len(web_results) else 0
+                    retrieval_calls.append({
+                        "query": query,
+                        "pdf_candidates": pdf_count,
+                        "web_candidates": web_count,
+                        "candidates": pdf_count + web_count,
+                    })
 
             pdf_candidates = []
             bm25_ids = set()
@@ -542,6 +606,7 @@ class ProductionRAGPipeline:
 
             log.info("[Query] Merged candidates: %d PDF + %d web = %d total",
                      len(pdf_candidates), len(web_chunks), len(all_candidates))
+            unique_candidate_count = len(all_candidates)
             # One and only one cross-encoder pass after PDF/web fusion.
             chunks = self.reranker.rerank_against_original(
                 question, all_candidates, retrieval_plan["candidate_k"], self.cfg.min_rerank_score
@@ -554,7 +619,7 @@ class ProductionRAGPipeline:
             chunks = self._diversify_sources(chunks, query_type, retrieval_plan["top_k"])
             trace.t_rerank = time.time()
 
-            if use_web_fallback and not retrieval_plan["always_web"] and not self._is_answerable(chunks):
+            if use_web_fallback and not retrieval_plan["always_web"] and not self._is_answerable(chunks, question):
                 log.info("[Query] Local sources failed answerability; using web fallback")
                 chunks = self._broader_web_retrieval(
                     question,
@@ -569,7 +634,7 @@ class ProductionRAGPipeline:
 
             safe_chunks = [{k: v for k, v in c.items()
                             if isinstance(v, (str, int, float, bool, type(None), list))} for c in chunks]
-            if self._is_answerable(chunks):
+            if self._is_answerable(chunks, question):
                 self.cache.set_retrieval(rewritten, safe_chunks)
             else:
                 log.info("[Cache] Skipping weak retrieval result")
@@ -580,13 +645,14 @@ class ProductionRAGPipeline:
         trace.top_rerank_score = max(scores) if scores else 0.0
         trace.bm25_overlap = len(bm25_ids & dense_ids)
 
-        answerable = self._is_answerable(chunks)
+        answerable = self._is_answerable(chunks, question)
         low_confidence = (
             trace.top_rerank_score < self.cfg.answerability_min_top_score
             or trace.mean_rerank_score < self.cfg.answerability_min_mean_score
         )
         require_web = low_confidence and self.cfg.low_confidence_requires_web
-        if (not answerable or require_web) and use_web_fallback and not web_scrape_used:
+        web_fallback_requested = (not answerable or require_web) and use_web_fallback and not web_scrape_used
+        if web_fallback_requested:
             log.info("[Query] %s; broadening web retrieval",
                      "Low confidence requires web evidence" if require_web
                      else "Answerability gate failed")
@@ -599,12 +665,22 @@ class ProductionRAGPipeline:
             )
             trace.t_retrieval = time.time()
             scores = [c.get("rerank_score", 0.0) for c in chunks if "rerank_score" in c]
-            answerable = self._is_answerable(chunks)
+            answerable = self._is_answerable(chunks, question)
             trace.num_chunks_retrieved = len(chunks)
             trace.mean_rerank_score = round(sum(scores) / len(scores), 4) if scores else 0.0
             trace.top_rerank_score = max(scores) if scores else 0.0
             trace.t_rerank = time.time()
             web_scrape_used = True
+
+        log.info(self._retrieval_debug_summary(
+            question,
+            retrieval_queries,
+            retrieval_calls,
+            unique_candidate_count,
+            chunks,
+            answerable,
+            web_fallback_requested,
+        ))
 
         context = self._format_context(chunks)
         if answerable:

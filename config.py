@@ -25,9 +25,9 @@ class RAGConfig:
     max_answer_chars: int = 5000
 
     # Retrieval
-    top_k_dense: int = 20
-    top_k_sparse: int = 20
-    top_k_rerank: int = 5
+    top_k_dense: int = 30
+    top_k_sparse: int = 30
+    top_k_rerank: int = 15
     rrf_k: int = 60
     min_rerank_score: float = -8.0
     min_mean_rerank_score: float = 0.0
