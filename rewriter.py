@@ -34,16 +34,20 @@ LATEST USER MESSAGE:
 Return ONLY the standalone question.""")
 
 _EXPANSION_PROMPT = ChatPromptTemplate.from_template("""
-You are generating parallel retrieval queries for a research system.
+You are generating parallel retrieval formulations for a research system.
 Return one retrieval query per line and nothing else.
 
-Include:
-- the standalone question's intent, entities, and constraints;
-- distinct formulations that improve recall, not cosmetic rewrites;
-- comparison dimensions and one focused query per option for comparisons.
+Generate 3 to 5 alternative formulations of the SAME question.
+Every formulation must seek the same answer as the standalone question.
+Use paraphrases and search-oriented wording to improve recall.
 
 Rules:
-- Keep the original meaning and scope. Do not answer the question.
+- Do not split the question into subquestions.
+- Do not introduce new entities, concepts, constraints, or decision criteria.
+- Do not ask about causes, benefits, limitations, components, or examples
+    unless the original question asks about them.
+- Preserve the original intent, entities, comparison options, and constraints.
+- Do not answer the question.
 - Produce 3 to 5 distinct queries.
 - Keep each query under 80 words.
 - Do not use bullets, numbering, labels, or explanations.

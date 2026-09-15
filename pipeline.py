@@ -408,8 +408,8 @@ class ProductionRAGPipeline:
             if key not in seen:
                 seen.add(key)
                 candidates.append(chunk)
-        reranked = self.reranker.rerank_queries(
-            broader_queries,
+        reranked = self.reranker.rerank_against_original(
+            question,
             candidates,
             max(limit * 2, limit + 2),
             self.cfg.min_rerank_score,
@@ -543,8 +543,8 @@ class ProductionRAGPipeline:
             log.info("[Query] Merged candidates: %d PDF + %d web = %d total",
                      len(pdf_candidates), len(web_chunks), len(all_candidates))
             # One and only one cross-encoder pass after PDF/web fusion.
-            chunks = self.reranker.rerank_queries(
-                retrieval_queries, all_candidates, retrieval_plan["candidate_k"], self.cfg.min_rerank_score
+            chunks = self.reranker.rerank_against_original(
+                question, all_candidates, retrieval_plan["candidate_k"], self.cfg.min_rerank_score
             )
             pdf_winners = [c for c in chunks if c.get("source_type") != "web" and c.get("parent_id")]
             web_winners = [c for c in chunks if c.get("source_type") == "web" or not c.get("parent_id")]

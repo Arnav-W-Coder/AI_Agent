@@ -855,6 +855,36 @@ class TestBM25Index:
         results = idx.search("quantum physics reactor", top_k=5)
         assert all(r["bm25_score"] > 0 for r in results)
 
+class TestOriginalQuestionReranking:
+    """retrieval.py — multi-query candidates are reranked by the original question."""
+
+    @pytest.mark.layer1
+    def test_rerank_against_original_uses_one_query_for_every_candidate(self):
+        from retrieval import CrossEncoderReranker
+
+        class FakeModel:
+            def __init__(self):
+                self.pairs = None
+
+            def predict(self, pairs):
+                self.pairs = pairs
+                return [0.9, 0.2]
+
+        reranker = CrossEncoderReranker.__new__(CrossEncoderReranker)
+        reranker._model = FakeModel()
+        reranker.cfg = None
+        chunks = [{"text": "strong evidence"}, {"text": "weak evidence"}]
+
+        results = reranker.rerank_against_original(
+            "How does the protocol work?", chunks, top_k=2, min_score=0.0
+        )
+
+        assert reranker._model.pairs == [
+            ("How does the protocol work?", "strong evidence"),
+            ("How does the protocol work?", "weak evidence"),
+        ]
+        assert results[0]["text"] == "strong evidence"
+
 
 # ── Rewriter SQLite helpers (no langchain imports) ────────────────────────────
 
