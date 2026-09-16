@@ -85,6 +85,7 @@ class RAGConfig:
     web_min_text_chars: int = 400
     web_min_page_quality: float = 0.45
     web_min_query_relevance: float = 0.20
+    web_min_candidates: int = 2
     web_authoritative_domains: tuple[str, ...] = (
         "cppreference.com", "cplusplus.com", "learn.microsoft.com",
         "docs.python.org", "developer.mozilla.org", "docs.oracle.com",
@@ -135,6 +136,7 @@ class RAGConfig:
     answerability_min_mean_score: float = -0.5
     answerability_min_chunks: int = 2
     answerability_min_query_term_coverage: float = 0.70
+    answerability_min_semantic_score: float = 0.65
     comparison_require_all_options: bool = True
     low_confidence_requires_web: bool = True
     destructive_critic_repair: bool = False

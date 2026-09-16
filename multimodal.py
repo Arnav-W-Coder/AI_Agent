@@ -25,6 +25,15 @@ class ImageRecord:
     chroma_id: str | None = None
 
 
+def markdown_has_table(markdown: str) -> bool:
+    """Return whether VLM markdown contains a recognizable pipe table."""
+    lines = [line.strip() for line in (markdown or "").splitlines() if line.strip()]
+    return any(
+        "|" in line and re.search(r"\|\s*:?-{2,}:?\s*(?:\||$)", line)
+        for line in lines
+    )
+
+
 class PageImageExtractor:
     def __init__(self, output_dir: str | Path, dpi: int = 144, min_drawing_count: int = 12, max_per_doc: int = 24):
         self.output_dir = Path(output_dir)

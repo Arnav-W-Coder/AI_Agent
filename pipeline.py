@@ -1,14 +1,17 @@
 """pipeline.py — Production RAG orchestration."""
 import ipaddress
+import base64
 import hashlib
 import logging
 import re
 import socket
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
+from sklearn.metrics.pairwise import cosine_similarity
 
 import numpy as np
 import requests
@@ -16,6 +19,7 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 from langchain_chroma import Chroma
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
@@ -318,19 +322,134 @@ class ProductionRAGPipeline:
         coverage = sum(term in evidence for term in terms) / len(terms)
         return coverage >= self.cfg.answerability_min_query_term_coverage
 
-    def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
-        scores = [
-            float(chunk.get("rerank_score", 0.0))
-            for chunk in chunks
-            if "rerank_score" in chunk and not chunk.get("context_only")
+    # def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
+    #     scores = [
+    #         float(chunk.get("rerank_score", 0.0))
+    #         for chunk in chunks
+    #         if "rerank_score" in chunk and not chunk.get("context_only")
+    #     ]
+    #     if len(chunks) < self.cfg.answerability_min_chunks or not scores:
+    #         return False
+    #     scoreable = (
+    #         max(scores) >= self.cfg.answerability_min_top_score
+    #         and sum(scores) / len(scores) >= self.cfg.answerability_min_mean_score
+    #     )
+    #     return scoreable and (not question or self._has_query_evidence(question, chunks))
+
+    def _semantic_evidence_score(self, question: str, chunks: list[dict]) -> float:
+        usable_chunks = [
+            chunk for chunk in chunks
+            if not chunk.get("context_only")
         ]
-        if len(chunks) < self.cfg.answerability_min_chunks or not scores:
-            return False
-        scoreable = (
-            max(scores) >= self.cfg.answerability_min_top_score
-            and sum(scores) / len(scores) >= self.cfg.answerability_min_mean_score
+
+        if not usable_chunks:
+            return 0.0
+
+        query_vector = np.asarray(
+            self.embeddings.embed_query(question),
+            dtype=np.float32,
+        ).reshape(1, -1)
+
+        chunk_vectors = self.embeddings.embed_documents(
+            [chunk["text"] for chunk in usable_chunks]
         )
-        return scoreable and (not question or self._has_query_evidence(question, chunks))
+
+        similarities = [
+            float(cosine_similarity(
+                query_vector,
+                np.asarray(chunk_vector, dtype=np.float32).reshape(1, -1),
+            )[0, 0])
+            for chunk_vector in chunk_vectors
+        ]
+
+        return max(similarities, default=0.0)
+
+    def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
+        usable_chunks = [
+            chunk
+            for chunk in chunks
+            if not chunk.get("context_only")
+        ]
+
+        if len(usable_chunks) < self.cfg.answerability_min_chunks:
+            log.info(
+                "[Answerability] FAILED at chunk-count stage: usable=%d, required=%d",
+                len(usable_chunks), self.cfg.answerability_min_chunks,
+            )
+            return False
+
+        scores = [
+            float(chunk["rerank_score"])
+            for chunk in usable_chunks
+            if "rerank_score" in chunk
+        ]
+
+        if not scores:
+            log.info(
+                "[Answerability] FAILED at reranking-score stage: no rerank scores"
+            )
+            return False
+
+        top_score = max(scores)
+        mean_score = sum(scores) / len(scores)
+
+        scoreable = (
+            top_score >= self.cfg.answerability_min_top_score
+            and mean_score >= self.cfg.answerability_min_mean_score
+        )
+
+        if not scoreable:
+            log.info(
+                "[Answerability] FAILED at reranking-score stage: top=%.4f "
+                "(min=%.4f), mean=%.4f (min=%.4f)",
+                top_score, self.cfg.answerability_min_top_score,
+                mean_score, self.cfg.answerability_min_mean_score,
+            )
+            return False
+
+        # Replace strict lexical evidence with semantic evidence.
+        semantic_score = self._semantic_evidence_score(
+            question,
+            usable_chunks,
+        )
+
+        if semantic_score >= self.cfg.answerability_min_semantic_score:
+            log.info(
+                "[Answerability] PASSED: reranking top=%.4f, mean=%.4f; "
+                "semantic=%.4f (min=%.4f)",
+                top_score, mean_score, semantic_score,
+                self.cfg.answerability_min_semantic_score,
+            )
+            return True
+
+        log.info(
+            "[Answerability] FAILED at semantic-evidence stage: semantic=%.4f "
+            "(min=%.4f); reranking top=%.4f, mean=%.4f",
+            semantic_score, self.cfg.answerability_min_semantic_score,
+            top_score, mean_score,
+        )
+        return False
+
+    def _web_evidence_is_relevant(self, question: str,
+                                  web_candidates: list[dict]) -> bool:
+        """Check web evidence independently before allowing web-backed generation."""
+        usable = [chunk for chunk in web_candidates if not chunk.get("context_only")]
+        if len(usable) < getattr(self.cfg, "web_min_candidates", 2):
+            return False
+        terms = self._query_evidence_terms(question)
+        if not terms:
+            return True
+        evidence = " ".join(
+            str(chunk.get("text", chunk.get("text_preview", ""))).lower()
+            for chunk in usable
+        )
+        coverage = sum(term in evidence for term in terms) / len(terms)
+        return coverage >= self.cfg.web_min_query_relevance
+
+    def _combined_evidence_is_answerable(self, question: str,
+                                         candidates: list[dict]) -> bool:
+        """Evaluate all retriever sources as one evidence set."""
+        return self._is_answerable(candidates, question)
 
     @staticmethod
     def _retrieval_debug_summary(question: str, rewritten_queries: list[str],
@@ -466,10 +585,8 @@ class ProductionRAGPipeline:
             max(limit * 2, limit + 2),
             self.cfg.min_rerank_score,
         )
-        pdf_winners = [chunk for chunk in reranked
-                       if chunk.get("source_type") != "web" and chunk.get("parent_id")]
-        web_winners = [chunk for chunk in reranked
-                       if chunk.get("source_type") == "web" or not chunk.get("parent_id")]
+        pdf_winners = [chunk for chunk in reranked if chunk.get("source_type") != "web"]
+        web_winners = [chunk for chunk in reranked if chunk.get("source_type") == "web"]
         expanded_pdf = self.retriever.expand_to_context(pdf_winners)
         recovered = sorted(
             expanded_pdf + web_winners,
@@ -483,6 +600,10 @@ class ProductionRAGPipeline:
         self.db = Database(cfg.db_path)
         self.embeddings = OllamaEmbeddings(model=cfg.embed_model)
         self.llm = ChatOllama(model=cfg.llm_model, num_ctx=cfg.ctx_window)
+        self.vision_llm = (
+            ChatOllama(model=cfg.vlm_model, num_ctx=cfg.ctx_window)
+            if cfg.multimodal_enabled and cfg.vlm_generation_enabled else None
+        )
         self.vectorstore = Chroma(
             persist_directory=str(cfg.chroma_dir), embedding_function=self.embeddings
         )
@@ -496,6 +617,9 @@ class ProductionRAGPipeline:
         self.web_store: Optional[WebChunkStore] = None
         self._rag_chain = _RAG_PROMPT | self.llm | StrOutputParser()
         self._query_count = 0
+        self._last_multimodal_usage = {
+            "generation_mode": "not_run", "images_attached": 0, "tables_attached": 0,
+        }
 
     async def setup(self) -> dict:
         log.info("=" * 60)
@@ -510,14 +634,66 @@ class ProductionRAGPipeline:
         log.info("[Pipeline] Setup complete — ready to query.")
         return {"ingested_files": summaries}
 
+    def create_conversation(self) -> str:
+        conversation_id = str(uuid.uuid4())
+        now = time.time()
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO conversations (id, created_at, updated_at) VALUES (?,?,?)",
+                (conversation_id, now, now),
+            )
+        return conversation_id
+
+    def _conversation_history(self, conversation_id: str) -> list[dict]:
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+                (conversation_id,),
+            ).fetchall()
+        return [{"role": row["role"], "content": row["content"]} for row in rows]
+
+    def _save_message(self, conversation_id: str, role: str, content: str) -> None:
+        now = time.time()
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?,?,?,?)",
+                (conversation_id, role, content, now),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (now, conversation_id),
+            )
+
+    def _contextualize_query(self, question: str,
+                             chat_history: Optional[list[dict | str]] = None) -> tuple[int, str, list[str]]:
+        """Resolve follow-ups into a standalone query before retrieval."""
+        rewrite_id, queries = self.rewriter.rewrite_queries(
+            question, chat_history=chat_history
+        )
+        standalone = (queries[0] if queries else question).strip() or question.strip()
+        log.info("[Query] Contextualized query: %s", standalone)
+        return rewrite_id, standalone, queries
+
     def query(self, question: str, metadata_filter: Optional[dict] = None,
-              use_web_fallback: bool = True) -> dict:
+              use_web_fallback: bool = True,
+              chat_history: Optional[list[dict | str]] = None,
+              conversation_id: Optional[str] = None) -> dict:
         assert self.retriever is not None, "Call await setup() before query()."
+        original_question = question
+        if conversation_id:
+            chat_history = [
+                *self._conversation_history(conversation_id),
+                *(chat_history or []),
+            ]
+            self._save_message(conversation_id, "user", original_question)
+        rewrite_id, contextualized_query, rewritten_queries = self._contextualize_query(
+            original_question, chat_history
+        )
+        question = contextualized_query
         trace = QueryTrace(query_text=question)
         log.info("\n[Query] '%s'", question[:80])
         query_emb = self._embed_query(question)
         query_type = self._classify_query(question)
-        rewrite_id, rewritten_queries = self.rewriter.rewrite_queries(question)
         retrieval_plan = self._route_query(question, query_type, rewritten_queries)
         retrieval_queries = retrieval_plan["queries"]
         log.info("[Query] Route=%s | retrieval_queries=%d | top_k=%d | web=%s",
@@ -536,14 +712,20 @@ class ProductionRAGPipeline:
         )
         if cached:
             answer, sources, critic_metadata = cached
+            multimodal_usage = self._usage_from_sources(sources, generation_mode="cached")
             trace.answer_cache_hit = True
             trace.t_end = time.time()
             self.metrics.record(trace)
+            if conversation_id:
+                self._save_message(conversation_id, "assistant", answer)
             return {"answer": answer, "sources": sources, "critic": critic_metadata,
                     "query_id": trace.query_id, "rewrite_id": rewrite_id,
                     "rewritten_query": rewritten, "from_cache": True,
                     "drift_alert": None,
-                    "metrics": {"answer_cache_hit": True, "total_ms": trace.total_ms()}}
+                    "conversation_id": conversation_id,
+                    "multimodal_usage": multimodal_usage,
+                    "metrics": {"answer_cache_hit": True, "total_ms": trace.total_ms(),
+                                "multimodal_usage": multimodal_usage}}
         cached_chunks = self.cache.get_retrieval(rewritten)
         bm25_ids: set = set()
         dense_ids: set = set()
@@ -611,15 +793,19 @@ class ProductionRAGPipeline:
             chunks = self.reranker.rerank_against_original(
                 question, all_candidates, retrieval_plan["candidate_k"], self.cfg.min_rerank_score
             )
-            pdf_winners = [c for c in chunks if c.get("source_type") != "web" and c.get("parent_id")]
-            web_winners = [c for c in chunks if c.get("source_type") == "web" or not c.get("parent_id")]
+            pdf_winners = [c for c in chunks if c.get("source_type") != "web"]
+            web_winners = [c for c in chunks if c.get("source_type") == "web"]
             expanded_pdf = self.retriever.expand_to_context(pdf_winners)
-            chunks = sorted(expanded_pdf + web_winners,
+            combined_chunks = sorted(expanded_pdf + web_winners,
                             key=lambda c: c.get("rerank_score", 0.0), reverse=True)
-            chunks = self._diversify_sources(chunks, query_type, retrieval_plan["top_k"])
+            chunks = self._diversify_sources(combined_chunks, query_type, retrieval_plan["top_k"])
             trace.t_rerank = time.time()
 
-            if use_web_fallback and not retrieval_plan["always_web"] and not self._is_answerable(chunks, question):
+            pdf_evidence = [chunk for chunk in combined_chunks if chunk.get("source_type") != "web"]
+            web_evidence = [chunk for chunk in combined_chunks if chunk.get("source_type") == "web"]
+            pdf_answerable = self._combined_evidence_is_answerable(question, pdf_evidence)
+            combined_answerable = self._combined_evidence_is_answerable(question, combined_chunks)
+            if use_web_fallback and not retrieval_plan["always_web"] and not pdf_answerable and not combined_answerable:
                 log.info("[Query] Local sources failed answerability; using web fallback")
                 chunks = self._broader_web_retrieval(
                     question,
@@ -634,7 +820,7 @@ class ProductionRAGPipeline:
 
             safe_chunks = [{k: v for k, v in c.items()
                             if isinstance(v, (str, int, float, bool, type(None), list))} for c in chunks]
-            if self._is_answerable(chunks, question):
+            if self._combined_evidence_is_answerable(question, chunks):
                 self.cache.set_retrieval(rewritten, safe_chunks)
             else:
                 log.info("[Cache] Skipping weak retrieval result")
@@ -645,13 +831,22 @@ class ProductionRAGPipeline:
         trace.top_rerank_score = max(scores) if scores else 0.0
         trace.bm25_overlap = len(bm25_ids & dense_ids)
 
-        answerable = self._is_answerable(chunks, question)
+        pdf_candidates = [chunk for chunk in chunks if chunk.get("source_type") != "web"]
+        web_candidates = [chunk for chunk in chunks if chunk.get("source_type") == "web"]
+        pdf_answerable = self._combined_evidence_is_answerable(question, pdf_candidates)
+        answerable = self._combined_evidence_is_answerable(question, chunks)
+        web_evidence_relevant = self._web_evidence_is_relevant(question, web_candidates)
         low_confidence = (
             trace.top_rerank_score < self.cfg.answerability_min_top_score
             or trace.mean_rerank_score < self.cfg.answerability_min_mean_score
         )
         require_web = low_confidence and self.cfg.low_confidence_requires_web
-        web_fallback_requested = (not answerable or require_web) and use_web_fallback and not web_scrape_used
+        web_fallback_requested = (
+            not pdf_answerable
+            and not answerable
+            and use_web_fallback
+            and not web_scrape_used
+        )
         if web_fallback_requested:
             log.info("[Query] %s; broadening web retrieval",
                      "Low confidence requires web evidence" if require_web
@@ -665,7 +860,10 @@ class ProductionRAGPipeline:
             )
             trace.t_retrieval = time.time()
             scores = [c.get("rerank_score", 0.0) for c in chunks if "rerank_score" in c]
-            answerable = self._is_answerable(chunks, question)
+            pdf_candidates = [chunk for chunk in chunks if chunk.get("source_type") != "web"]
+            web_candidates = [chunk for chunk in chunks if chunk.get("source_type") == "web"]
+            answerable = self._combined_evidence_is_answerable(question, chunks)
+            web_evidence_relevant = self._web_evidence_is_relevant(question, web_candidates)
             trace.num_chunks_retrieved = len(chunks)
             trace.mean_rerank_score = round(sum(scores) / len(scores), 4) if scores else 0.0
             trace.top_rerank_score = max(scores) if scores else 0.0
@@ -683,9 +881,12 @@ class ProductionRAGPipeline:
         ))
 
         context = self._format_context(chunks)
+        self._last_multimodal_usage = {
+            "generation_mode": "not_run", "images_attached": 0, "tables_attached": 0,
+        }
         if answerable:
             log.info("[Query] Generating answer over %d chunks...", len(chunks))
-            raw_answer = self._rag_chain.invoke({"context": context, "question": question}).strip()
+            raw_answer = self._generate_multimodal(question, context, chunks).strip()
             answer = self._sanitize_answer(raw_answer)
         else:
             log.warning("[Query] Answerability gate failed; returning insufficient-information response")
@@ -749,6 +950,12 @@ class ProductionRAGPipeline:
         trace.answer_faithfulness = faith_score
 
         sources = [self._source_provenance(c, i) for i, c in enumerate(chunks, 1)]
+        multimodal_usage = self._usage_from_sources(
+            sources,
+            generation_mode=self._last_multimodal_usage["generation_mode"],
+            images_attached=self._last_multimodal_usage["images_attached"],
+            tables_attached=self._last_multimodal_usage["tables_attached"],
+        )
         if validated:
             self.cache.set_answer(
                 question,
@@ -762,6 +969,8 @@ class ProductionRAGPipeline:
             log.info("[Cache] Skipping answer cache; critic validation=%s", validated)
         trace.t_end = time.time()
         self.metrics.record(trace)
+        if conversation_id:
+            self._save_message(conversation_id, "assistant", answer)
         self.rewriter.record_answer_score(rewrite_id, faith_score)
         if faith_score >= self.cfg.rewriter_helpful_min_score:
             self.rewriter.record_feedback(rewrite_id, helpful=True)
@@ -776,6 +985,8 @@ class ProductionRAGPipeline:
             "query_id": trace.query_id,
             "rewrite_id": rewrite_id, "rewritten_query": rewritten, "from_cache": False,
             "drift_alert": drift_alert,
+            "conversation_id": conversation_id,
+            "multimodal_usage": multimodal_usage,
             "metrics": {
                 "total_ms": trace.total_ms(),
                 "rewrite_ms": trace.latency_ms(trace.t_start, trace.t_rewrite),
@@ -793,6 +1004,10 @@ class ProductionRAGPipeline:
                 "answerable": answerable,
                 "low_confidence": low_confidence,
                 "web_scrape_used": web_scrape_used,
+                "pdf_answerable": pdf_answerable,
+                "web_candidates": len(web_candidates),
+                "web_evidence_relevant": web_evidence_relevant,
+                "multimodal_usage": multimodal_usage,
             },
         }
 
@@ -819,6 +1034,68 @@ class ProductionRAGPipeline:
     def _embed_query(self, text: str) -> np.ndarray:
         return np.asarray(self.embeddings.embed_documents([text])[0], dtype=np.float32)
 
+    def _select_image_chunks(self, chunks: list[dict]) -> list[dict]:
+        selected = []
+        seen = set()
+        for chunk in chunks:
+            image_path = chunk.get("image_path")
+            if not image_path or image_path in seen or not Path(image_path).is_file():
+                continue
+            seen.add(image_path)
+            selected.append(chunk)
+            if len(selected) >= self.cfg.image_top_k:
+                break
+        return selected
+
+    def _generate_multimodal(self, question: str, context: str,
+                             chunks: list[dict]) -> str:
+        image_chunks = self._select_image_chunks(chunks)
+        if not image_chunks or self.vision_llm is None:
+            self._last_multimodal_usage = {
+                "generation_mode": "text_only", "images_attached": 0, "tables_attached": 0,
+            }
+            return self._rag_chain.invoke({"context": context, "question": question})
+        self._last_multimodal_usage = {
+            "generation_mode": "vision", "images_attached": len(image_chunks),
+            "tables_attached": sum(bool(chunk.get("has_table")) for chunk in image_chunks),
+        }
+        content = [{
+            "type": "text",
+            "text": (
+                "Answer the question using the supplied text context and inspect the attached "
+                "PDF page images when useful.\n\n"
+                f"CONTEXT:\n{context}\n\nQUESTION: {question}"
+            ),
+        }]
+        for chunk in image_chunks:
+            encoded = base64.b64encode(Path(chunk["image_path"]).read_bytes()).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": f"data:image/png;base64,{encoded}",
+            })
+        try:
+            response = self.vision_llm.invoke([HumanMessage(content=content)])
+            return response.content if hasattr(response, "content") else str(response)
+        except Exception as exc:
+            log.warning("[Generation] Vision model failed; using text-only generation: %s", exc)
+            self._last_multimodal_usage["generation_mode"] = "text_only_fallback"
+            return self._rag_chain.invoke({"context": context, "question": question})
+
+    @staticmethod
+    def _usage_from_sources(sources: list[dict], generation_mode: str,
+                            images_attached: int = 0, tables_attached: int = 0) -> dict:
+        images_retrieved = sum(bool(source.get("has_image")) for source in sources)
+        tables_retrieved = sum(bool(source.get("has_table")) for source in sources)
+        return {
+            "generation_mode": generation_mode,
+            "images_retrieved": images_retrieved,
+            "tables_retrieved": tables_retrieved,
+            "images_attached": images_attached,
+            "tables_attached": tables_attached,
+            "used_image": images_attached > 0,
+            "used_table": tables_attached > 0,
+        }
+
     def _format_context(self, chunks: list[dict]) -> str:
         parts = []
         for i, chunk in enumerate(chunks, 1):
@@ -835,7 +1112,8 @@ class ProductionRAGPipeline:
                 section = chunk.get("section_path", "")
                 location = f"{source} | page {page}" + (f" | section {section}" if section else "")
             title_label = f" | title {title}" if title else ""
-            parts.append(f"[Source {i} | type {source_type}{title_label} | {location} | score {score:.2f}]\n{text}")
+            image_label = " | has image" if chunk.get("image_path") else ""
+            parts.append(f"[Source {i} | type {source_type}{title_label} | {location} | score {score:.2f}{image_label}]\n{text}")
         return "\n\n---\n\n".join(parts)
 
     def _source_provenance(self, chunk: dict, index: int) -> dict:
@@ -866,6 +1144,8 @@ class ProductionRAGPipeline:
             "filename": Path(chunk.get("filename", "unknown")).name,
             "page": chunk.get("page_number", 0),
             "section": chunk.get("section_path", "") or None,
+            "has_image": bool(chunk.get("image_path")),
+                "has_table": bool(chunk.get("has_table")),
             "retrieved_at": None,
             "rerank_score": round(chunk.get("rerank_score", 0.0), 3),
         }

@@ -23,6 +23,7 @@ from checkpoints import checkpoint
 from config import RAGConfig
 from db import Database
 from chunking import HierarchicalChunker, ChunkRecord
+from multimodal import extract_and_caption, ImageRecord, markdown_has_table
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,10 @@ class AsyncIngestionPipeline:
             doc_ids = [r["id"] for r in conn.execute(
                 "SELECT id FROM documents WHERE filepath = ?", (str(filepath),)
             ).fetchall()]
+            image_paths = [r["file_path"] for r in conn.execute(
+                "SELECT file_path FROM images WHERE doc_id IN "
+                "(SELECT id FROM documents WHERE filepath = ?)", (str(filepath),)
+            ).fetchall()]
         if rows:
             try:
                 ids = [r["chroma_id"] for r in rows if r["chroma_id"]]
@@ -121,8 +126,14 @@ class AsyncIngestionPipeline:
                 log.warning("[Ingestion] Could not remove old Chroma vectors: %s", exc)
         if doc_ids:
             with self.db.connect() as conn:
+                conn.executemany("DELETE FROM images WHERE doc_id = ?", [(d,) for d in doc_ids])
                 conn.executemany("DELETE FROM chunks WHERE doc_id = ?", [(d,) for d in doc_ids])
                 conn.executemany("DELETE FROM documents WHERE id = ?", [(d,) for d in doc_ids])
+            for image_path in image_paths:
+                try:
+                    Path(image_path).unlink(missing_ok=True)
+                except OSError as exc:
+                    log.warning("[Ingestion] Could not remove old image %s: %s", image_path, exc)
 
     async def _embed_batch(self, chunks: list[ChunkRecord], doc_id: str, executor: ThreadPoolExecutor) -> None:
         loop = asyncio.get_event_loop()
@@ -175,6 +186,48 @@ class AsyncIngestionPipeline:
                      chunk.text[:200], chunk.text, "child", chunk.parent_id,
                      chunk.end_page, chunk.section_path),
                 )
+
+    async def _embed_images(self, records: list[ImageRecord], doc_id: str,
+                            source: str, executor: ThreadPoolExecutor) -> int:
+        records = [record for record in records if record.caption or record.markdown]
+        if not records:
+            return 0
+        texts = [f"Caption: {record.caption}\n\n{record.markdown}".strip() for record in records]
+        loop = asyncio.get_event_loop()
+        vectors = await loop.run_in_executor(executor, self.embeddings.embed_documents, texts)
+        if len(vectors) != len(records):
+            raise RuntimeError("Image embedding batch returned an unexpected vector count")
+        chroma_ids = [str(uuid.uuid4()) for _ in records]
+        metadatas = [{
+            "doc_id": doc_id, "parent_id": "", "chunk_type": "image_caption",
+            "source": source, "filename": Path(source).name,
+            "page": record.page_number, "end_page": record.page_number,
+            "section_path": "", "image_path": record.file_path,
+            "has_table": markdown_has_table(record.markdown),
+        } for record in records]
+        self.vectorstore._collection.upsert(
+            ids=chroma_ids, documents=texts, embeddings=vectors, metadatas=metadatas
+        )
+        with self.db.connect() as conn:
+            for index, (record, chroma_id, text) in enumerate(zip(records, chroma_ids, texts)):
+                conn.execute(
+                    """INSERT INTO chunks
+                                             (id, doc_id, chroma_id, chunk_index, page_number, text_preview,
+                                                   text, chunk_type, parent_id, end_page, section_path, image_path)
+                                                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (str(uuid.uuid4()), doc_id, chroma_id, 1000000 + index,
+                     record.page_number, text[:200], text, "image_caption", None,
+                                         record.page_number, "", record.file_path),
+                )
+                conn.execute(
+                    """INSERT INTO images
+                                             (doc_id, chroma_id, page_number, file_path, caption, markdown, has_table, width, height)
+                                             VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (doc_id, chroma_id, record.page_number, record.file_path,
+                                         record.caption, record.markdown, int(markdown_has_table(record.markdown)),
+                                         record.width, record.height),
+                )
+        return len(records)
 
     def _store_parents(self, parents: list[ChunkRecord], doc_id: str, source: str) -> None:
         with self.db.connect() as conn:
@@ -250,10 +303,37 @@ class AsyncIngestionPipeline:
             batch = children[i:i + batch_size]
             await self._embed_batch(batch, doc_id, executor)
 
+        image_count = 0
+        detected_image_count = 0
+        table_count = 0
+        if self.cfg.multimodal_enabled:
+            try:
+                loop = asyncio.get_event_loop()
+                records = await loop.run_in_executor(
+                    executor,
+                    lambda: extract_and_caption(
+                        path, doc_id, self.cfg.image_store_dir,
+                        dpi=self.cfg.image_render_dpi,
+                        min_drawing_count=self.cfg.image_min_drawing_count,
+                        max_per_doc=self.cfg.image_max_per_doc,
+                        model=self.cfg.vlm_model,
+                        workers=self.cfg.vlm_ingest_workers,
+                        enabled=self.cfg.multimodal_enabled,
+                    ),
+                )
+                detected_image_count = len(records)
+                table_count = sum(markdown_has_table(record.markdown) for record in records)
+                image_count = await self._embed_images(records, doc_id, str(path), executor)
+            except Exception as exc:
+                log.warning("[Ingestion] Multimodal extraction skipped for %s: %s", path.name, exc)
+
         elapsed = time.time() - t0
         summary = {
             "filename": path.name, "pages": page_count, "parents": len(parents),
-            "children": len(children), "chunks": len(children), "elapsed_s": round(elapsed, 1),
+            "children": len(children), "chunks": len(children),
+            "images_detected": detected_image_count, "images_indexed": image_count,
+            "tables_indexed": table_count,
+            "elapsed_s": round(elapsed, 1),
         }
         checkpoint("ingestion.file_complete", summary,
                    enabled=self.cfg.debug_checkpoints,

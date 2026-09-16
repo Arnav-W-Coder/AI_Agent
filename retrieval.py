@@ -39,17 +39,19 @@ class BM25Index:
 
     def rebuild(self) -> None:
         with self.db.connect() as conn:
-            rows = conn.execute("""SELECT c.chroma_id, c.text, c.text_preview, c.page_number,
-                          c.end_page, c.doc_id, c.parent_id, c.section_path, d.filename
+                 rows = conn.execute("""SELECT c.chroma_id, c.text, c.text_preview, c.page_number,
+                         c.end_page, c.doc_id, c.parent_id, c.section_path,
+                         c.chunk_type, c.image_path, COALESCE(i.has_table, 0) AS has_table, d.filename
                    FROM chunks c JOIN documents d ON c.doc_id = d.id
-                   WHERE c.chunk_type = 'child' AND c.chroma_id <> ''""").fetchall()
+                     LEFT JOIN images i ON i.chroma_id = c.chroma_id
+                     WHERE c.chunk_type IN ('child', 'image_caption') AND c.chroma_id <> ''""").fetchall()
         self._chunks = [dict(r) for r in rows]
         if not self._chunks:
             self._bm25 = None
             log.info("[BM25] No child chunks — index empty")
             return
         self._bm25 = BM25Okapi([_tokenize(c.get("text") or c.get("text_preview") or "") for c in self._chunks])
-        log.info("[BM25] Index rebuilt: %d child chunks", len(self._chunks))
+        log.info("[BM25] Index rebuilt: %d searchable chunks", len(self._chunks))
         checkpoint("retrieval.bm25.index_ready", self._chunks,
                     enabled=getattr(self.cfg, "debug_checkpoints", True),
                     preview_chars=getattr(self.cfg, "checkpoint_preview_chars", 160),
@@ -137,7 +139,10 @@ class HybridRetriever:
             chunks.append({"chroma_id": cid, "text": text or "", "doc_id": meta.get("doc_id", ""),
                            "parent_id": meta.get("parent_id", ""), "filename": meta.get("source", ""),
                            "page_number": meta.get("page", 0), "end_page": meta.get("end_page", meta.get("page", 0)),
-                           "section_path": meta.get("section_path", ""), "chunk_type": "child",
+                           "section_path": meta.get("section_path", ""),
+                           "chunk_type": meta.get("chunk_type", "child"),
+                           "image_path": meta.get("image_path", ""),
+                           "has_table": bool(meta.get("has_table", False)),
                            "dense_score": round(1 - float(dist), 4)})
         checkpoint("retrieval.dense.search_output", chunks, enabled=self.cfg.debug_checkpoints,
                    preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
@@ -165,7 +170,11 @@ class HybridRetriever:
                             "filename": meta.get("source", meta.get("filename", chunk.get("filename", ""))),
                             "page_number": meta.get("page", chunk.get("page_number", 0)),
                             "parent_id": meta.get("parent_id", chunk.get("parent_id", "")),
-                            "section_path": meta.get("section_path", chunk.get("section_path", "")), "rrf_score": 0.0}
+                            "section_path": meta.get("section_path", chunk.get("section_path", "")),
+                            "chunk_type": meta.get("chunk_type", chunk.get("chunk_type", "child")),
+                            "image_path": meta.get("image_path", chunk.get("image_path", "")),
+                            "has_table": bool(meta.get("has_table", chunk.get("has_table", False))),
+                            "rrf_score": 0.0}
             rrf[cid]["rrf_score"] += self._rrf_score(rank)
         candidates = sorted(rrf.values(), key=lambda c: c["rrf_score"], reverse=True)[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)]
         checkpoint("retrieval.rrf.fused_output", candidates, enabled=self.cfg.debug_checkpoints,

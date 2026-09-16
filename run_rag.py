@@ -94,6 +94,18 @@ def print_result(result: dict) -> None:
         for key, value in metrics.items():
             print(f"{key}: {value}")
 
+    usage = result.get("multimodal_usage")
+    if usage:
+        print("\nMULTIMODAL USAGE")
+        print("-" * 70)
+        print(f"generation_mode: {usage['generation_mode']}")
+        print(f"images_retrieved: {usage['images_retrieved']}")
+        print(f"tables_retrieved: {usage['tables_retrieved']}")
+        print(f"images_attached: {usage['images_attached']}")
+        print(f"tables_attached: {usage['tables_attached']}")
+        print(f"used_image: {usage['used_image']}")
+        print(f"used_table: {usage['used_table']}")
+
     rewritten = result.get("rewritten_query")
     if rewritten:
         print(f"\nRewritten query: {rewritten}")
@@ -112,6 +124,7 @@ async def main() -> None:
 
     try:
         pipeline = await build_pipeline()
+        conversation_id = pipeline.create_conversation()
     except Exception:
         sys.exit(1)
 
@@ -156,6 +169,7 @@ async def main() -> None:
                 question,
                 metadata_filter=None,
                 use_web_fallback=True,
+                conversation_id=conversation_id,
             )
             print_result(result)
         except Exception:
