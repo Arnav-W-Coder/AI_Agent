@@ -19,10 +19,21 @@ class RAGConfig:
     docs_dir: Path = field(default_factory=lambda: Path("./docs"))
     chroma_dir: Path = field(default_factory=lambda: Path("./chroma_db"))
     db_path: Path = field(default_factory=lambda: Path("./rag.db"))
+    image_store_dir: Path = field(default_factory=lambda: Path("./image_store"))
 
     # LLM
     ctx_window: int = 16384
     max_answer_chars: int = 5000
+
+    # Multimodal ingestion and generation
+    multimodal_enabled: bool = True
+    vlm_model: str = "llama3.2-vision"
+    image_render_dpi: int = 144
+    image_min_drawing_count: int = 12
+    image_max_per_doc: int = 24
+    image_top_k: int = 4
+    vlm_ingest_workers: int = 2
+    vlm_generation_enabled: bool = True
 
     # Retrieval
     top_k_dense: int = 30
@@ -106,18 +117,14 @@ class RAGConfig:
     # Chunking
     chunk_size: int = 500
     chunk_overlap: int = 75
-
-    # Semantic and hierarchical chunking
     semantic_chunking_enabled: bool = True
     semantic_breakpoint_percentile: float = 90.0
     semantic_min_distance: float = 0.0
     semantic_min_block_tokens: int = 80
-
     parent_target_tokens: int = 600
     parent_max_tokens: int = 900
     child_max_tokens: int = 220
     child_overlap_tokens: int = 40
-
     context_neighbor_count: int = 1
     context_budget_tokens: int = 6000
 
