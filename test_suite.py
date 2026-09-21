@@ -35,6 +35,7 @@ import pytest_asyncio
 
 from config import RAGConfig
 from db import Database
+from memory import ConversationMemory
 from cache import CacheLayer, _cosine_sim, _emb_to_bytes, _bytes_to_emb
 from metrics import MetricsRecorder, QueryTrace
 from chunking import HierarchicalChunker, ChunkRecord
@@ -175,6 +176,21 @@ class TestDatabase:
             ).fetchall()
         assert [(row["role"], row["content"]) for row in rows] == [
             ("user", "Who are the characters?")
+        ]
+
+    @pytest.mark.layer1
+    def test_conversation_memory_respects_configured_history_limit(
+            self, db: Database, cfg: RAGConfig):
+        cfg.max_history_messages = 2
+        memory = ConversationMemory(db, cfg.max_history_messages)
+        conversation_id = memory.create_conversation()
+        memory.add_message(conversation_id, "user", "First")
+        memory.add_message(conversation_id, "assistant", "Second")
+        memory.add_message(conversation_id, "user", "Third")
+
+        assert memory.history(conversation_id) == [
+            {"role": "assistant", "content": "Second"},
+            {"role": "user", "content": "Third"},
         ]
 
     @pytest.mark.layer1
@@ -646,29 +662,41 @@ class TestCriticAndAnswerControls:
         ]) is False
 
     @pytest.mark.layer1
-    def test_semantic_answerability_accepts_one_dimensional_embeddings(self, cfg):
+    def test_answerability_mean_uses_strongest_score_window(self, cfg):
         from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.answerability_min_chunks = 2
+        cfg.answerability_score_window = 2
+        cfg.answerability_min_top_score = 0.0
+        cfg.answerability_min_mean_score = 0.5
 
-        class FakeEmbeddings:
-            def embed_query(self, text):
-                return [1.0, 0.0]
+        chunks = [
+            {"rerank_score": 0.9},
+            {"rerank_score": 0.8},
+            {"rerank_score": -4.0},
+            {"rerank_score": -5.0},
+        ]
+        assert instance._is_answerable(chunks) is True
+        debug = instance._answerability_debug(chunks, "")
+        assert debug["all_chunk_mean"] == pytest.approx(-1.825)
+        assert debug["strongest_chunk_mean"] == pytest.approx(0.85)
 
-            def embed_documents(self, texts):
-                return [[1.0, 0.0] for _ in texts]
+    @pytest.mark.layer1
+    def test_answerability_uses_query_term_coverage(self, cfg):
+        from pipeline import ProductionRAGPipeline
 
         instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
         instance.cfg = cfg
-        instance.embeddings = FakeEmbeddings()
         cfg.answerability_min_chunks = 2
         cfg.answerability_min_top_score = 0.0
         cfg.answerability_min_mean_score = 0.0
-        cfg.answerability_min_semantic_score = 0.5
+        cfg.answerability_min_query_term_coverage = 0.5
 
         chunks = [
-            {"rerank_score": 0.8, "text": "Relevant evidence"},
-            {"rerank_score": 0.7, "text": "More relevant evidence"},
+            {"rerank_score": 0.8, "text": "Relevant question evidence"},
+            {"rerank_score": 0.7, "text": "More question evidence"},
         ]
-        assert instance._semantic_evidence_score("question", chunks) == pytest.approx(1.0)
         assert instance._is_answerable(chunks, "question") is True
 
     @pytest.mark.layer1
@@ -704,6 +732,19 @@ class TestCriticAndAnswerControls:
         assert "url https://example.com/research" in context
         assert provenance["domain"] == "example.com"
         assert provenance["rerank_score"] == 0.812
+
+    @pytest.mark.layer1
+    def test_cached_answer_context_is_labeled_and_keeps_source_metadata(self):
+        from pipeline import ProductionRAGPipeline
+
+        context = ProductionRAGPipeline._format_cached_answer_context(
+            "Previously generated answer.",
+            [{"title": "RAG research"}, {"url": "https://example.com/research"}],
+        )
+
+        assert "PRIOR CACHED ANSWER - UNVERIFIED MODEL OUTPUT" in context
+        assert "Previously generated answer." in context
+        assert "RAG research; https://example.com/research" in context
 
 
 class TestQueryRewriteControls:
@@ -965,6 +1006,20 @@ class TestOriginalQuestionReranking:
             ("How does the protocol work?", "weak evidence"),
         ]
         assert results[0]["text"] == "strong evidence"
+
+    @pytest.mark.layer1
+    def test_generation_request_builds_evidence_query(self):
+        from pipeline import ProductionRAGPipeline
+
+        assert ProductionRAGPipeline._is_generation_request(
+            "Write an introduction for The Great Gatsby"
+        ) is True
+        assert ProductionRAGPipeline._generation_retrieval_query(
+            "Write an introductory paragraph for The Great Gatsby"
+        ) == "The Great Gatsby"
+        assert ProductionRAGPipeline._generation_retrieval_query(
+            "Implement a hybrid RAG retriever"
+        ) == "a hybrid RAG retriever"
 
     @pytest.mark.layer1
     def test_answerability_rejects_keyword_mismatch(self, cfg):

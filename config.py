@@ -23,7 +23,8 @@ class RAGConfig:
 
     # LLM
     ctx_window: int = 16384
-    max_answer_chars: int = 5000
+    max_answer_chars: int = 7000
+    max_history_messages: int = 12
 
     # Multimodal ingestion and generation
     multimodal_enabled: bool = True
@@ -36,9 +37,9 @@ class RAGConfig:
     vlm_generation_enabled: bool = True
 
     # Retrieval
-    top_k_dense: int = 30
-    top_k_sparse: int = 30
-    top_k_rerank: int = 15
+    top_k_dense: int = 40
+    top_k_sparse: int = 40
+    top_k_rerank: int = 25
     rrf_k: int = 60
     min_rerank_score: float = -8.0
     min_mean_rerank_score: float = 0.0
@@ -126,8 +127,8 @@ class RAGConfig:
     parent_max_tokens: int = 900
     child_max_tokens: int = 220
     child_overlap_tokens: int = 40
-    context_neighbor_count: int = 1
-    context_budget_tokens: int = 6000
+    context_neighbor_count: int = 2
+    context_budget_tokens: int = 9000
 
     # Query routing / confidence
     query_routing_enabled: bool = True
@@ -135,8 +136,8 @@ class RAGConfig:
     answerability_min_top_score: float = 0.0
     answerability_min_mean_score: float = -0.5
     answerability_min_chunks: int = 2
-    answerability_min_query_term_coverage: float = 0.70
-    answerability_min_semantic_score: float = 0.65
+    answerability_score_window: int = 5
+    answerability_min_query_term_coverage: float = 0.50
     comparison_require_all_options: bool = True
     low_confidence_requires_web: bool = True
     destructive_critic_repair: bool = False

@@ -124,7 +124,7 @@ async def main() -> None:
 
     try:
         pipeline = await build_pipeline()
-        conversation_id = pipeline.create_conversation()
+        conversation_id = pipeline.memory.create_conversation()
     except Exception:
         sys.exit(1)
 

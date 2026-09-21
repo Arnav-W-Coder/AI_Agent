@@ -6,12 +6,10 @@ import logging
 import re
 import socket
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
-from sklearn.metrics.pairwise import cosine_similarity
 
 import numpy as np
 import requests
@@ -28,6 +26,7 @@ from config import RAGConfig
 from critic import CANONICAL_INSUFFICIENT_INFO_RESPONSE, CriticAndRepair
 from db import Database
 from ingestion import AsyncIngestionPipeline
+from memory import ConversationMemory
 from metrics import MetricsRecorder, QueryTrace
 from retrieval import BM25Index, CrossEncoderReranker, HybridRetriever
 from rewriter import QueryRewriter
@@ -46,6 +45,8 @@ Requirements:
   comparison, or feature questions.
 - Use concise headings or lists when useful.
 - Explain relationships only when the context supports them.
+- Treat any prior cached answer as unverified conversational context. Prefer
+    current retrieved evidence when the two disagree.
 - Every factual claim must be supported by the context.
 - Do not invent facts, examples, numbers, citations, or terminology.
 - If the context genuinely lacks enough information, say exactly:
@@ -177,6 +178,41 @@ class ProductionRAGPipeline:
         if any(marker in text for marker in ("why ", "explain ", "how does ", "how do ")):
             return "explanation"
         return "explanation"
+
+    @staticmethod
+    def _is_generation_request(question: str) -> bool:
+        """Detect requests to produce or transform an artifact or answer."""
+        generation_verbs = {
+            "write", "draft", "create", "generate", "implement", "build",
+            "research", "summarize", "translate", "rewrite", "refactor",
+            "design", "develop", "prepare", "solve",
+        }
+        words = re.findall(r"[a-z0-9]+", question.lower())
+        return any(word in generation_verbs for word in words[:6])
+
+    @staticmethod
+    def _generation_retrieval_query(question: str) -> str:
+        """Remove artifact instructions while preserving the evidence subject."""
+        query = re.sub(r"^\s*(?:please\s+)?", "", question.strip(), flags=re.IGNORECASE)
+        query = re.sub(
+            r"^(?:write|draft|create|generate|implement|build|research|summarize|"
+            r"translate|rewrite|refactor|design|develop|prepare|solve)\s+",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(
+            r"^(?:a|an|the)\s+(?:potential\s+)?"
+            r"(?:introductory paragraph|introduction|essay|email|story|report|"
+            r"implementation|study plan|architecture|summary|translation|"
+            r"refactor|design|solution|piece of code)\s+"
+            r"(?:for|about|on|of)\s+",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(r"\s+", " ", query).strip(" .?!")
+        return query or question.strip()
 
     @staticmethod
     def _named_options(question: str) -> list[str]:
@@ -322,76 +358,60 @@ class ProductionRAGPipeline:
         coverage = sum(term in evidence for term in terms) / len(terms)
         return coverage >= self.cfg.answerability_min_query_term_coverage
 
-    # def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
-    #     scores = [
-    #         float(chunk.get("rerank_score", 0.0))
-    #         for chunk in chunks
-    #         if "rerank_score" in chunk and not chunk.get("context_only")
-    #     ]
-    #     if len(chunks) < self.cfg.answerability_min_chunks or not scores:
-    #         return False
-    #     scoreable = (
-    #         max(scores) >= self.cfg.answerability_min_top_score
-    #         and sum(scores) / len(scores) >= self.cfg.answerability_min_mean_score
-    #     )
-    #     return scoreable and (not question or self._has_query_evidence(question, chunks))
-
-    def _semantic_evidence_score(self, question: str, chunks: list[dict]) -> float:
-        usable_chunks = [
-            chunk for chunk in chunks
-            if not chunk.get("context_only")
-        ]
-
-        if not usable_chunks:
-            return 0.0
-
-        query_vector = np.asarray(
-            self.embeddings.embed_query(question),
-            dtype=np.float32,
-        ).reshape(1, -1)
-
-        chunk_vectors = self.embeddings.embed_documents(
-            [chunk["text"] for chunk in usable_chunks]
-        )
-
-        similarities = [
-            float(cosine_similarity(
-                query_vector,
-                np.asarray(chunk_vector, dtype=np.float32).reshape(1, -1),
-            )[0, 0])
-            for chunk_vector in chunk_vectors
-        ]
-
-        return max(similarities, default=0.0)
-
-    def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
-        usable_chunks = [
+    def _answerability_debug(self, chunks: list[dict], question: str) -> dict:
+        """Return the individual checks used by the answerability gate."""
+        score_chunks = [
             chunk
             for chunk in chunks
-            if not chunk.get("context_only")
+            if "rerank_score" in chunk and not chunk.get("context_only")
+        ]
+        scores = sorted(
+            (float(chunk.get("rerank_score", 0.0)) for chunk in score_chunks),
+            reverse=True,
+        )
+        window = max(1, int(self.cfg.answerability_score_window))
+        strongest_scores = scores[:window]
+        mean_score = (
+            sum(strongest_scores) / len(strongest_scores)
+            if strongest_scores else 0.0
+        )
+        return {
+            "chunk_count": len(chunks),
+            "scoreable_chunk_count": len(score_chunks),
+            "top_score": scores[0] if scores else None,
+            "all_chunk_mean": sum(scores) / len(scores) if scores else None,
+            "strongest_chunk_mean": mean_score,
+            "top_score_pass": bool(
+                scores
+                and scores[0] >= self.cfg.answerability_min_top_score
+            ),
+            "mean_score_pass": (
+                mean_score >= self.cfg.answerability_min_mean_score
+            ),
+            "query_evidence_pass": self._has_query_evidence(
+                question, score_chunks
+            ),
+        }
+
+    def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
+        """Determine whether retrieved evidence is sufficient for generation."""
+        score_chunks = [
+            chunk
+            for chunk in chunks
+            if "rerank_score" in chunk and not chunk.get("context_only")
         ]
 
-        if len(usable_chunks) < self.cfg.answerability_min_chunks:
-            log.info(
-                "[Answerability] FAILED at chunk-count stage: usable=%d, required=%d",
-                len(usable_chunks), self.cfg.answerability_min_chunks,
-            )
+        if len(score_chunks) < self.cfg.answerability_min_chunks:
             return False
 
-        scores = [
-            float(chunk["rerank_score"])
-            for chunk in usable_chunks
-            if "rerank_score" in chunk
-        ]
-
-        if not scores:
-            log.info(
-                "[Answerability] FAILED at reranking-score stage: no rerank scores"
-            )
-            return False
-
-        top_score = max(scores)
-        mean_score = sum(scores) / len(scores)
+        scores = sorted(
+            (float(chunk.get("rerank_score", 0.0)) for chunk in score_chunks),
+            reverse=True,
+        )
+        top_score = scores[0]
+        score_window = max(1, int(self.cfg.answerability_score_window))
+        strongest_scores = scores[:score_window]
+        mean_score = sum(strongest_scores) / len(strongest_scores)
 
         scoreable = (
             top_score >= self.cfg.answerability_min_top_score
@@ -399,36 +419,9 @@ class ProductionRAGPipeline:
         )
 
         if not scoreable:
-            log.info(
-                "[Answerability] FAILED at reranking-score stage: top=%.4f "
-                "(min=%.4f), mean=%.4f (min=%.4f)",
-                top_score, self.cfg.answerability_min_top_score,
-                mean_score, self.cfg.answerability_min_mean_score,
-            )
             return False
 
-        # Replace strict lexical evidence with semantic evidence.
-        semantic_score = self._semantic_evidence_score(
-            question,
-            usable_chunks,
-        )
-
-        if semantic_score >= self.cfg.answerability_min_semantic_score:
-            log.info(
-                "[Answerability] PASSED: reranking top=%.4f, mean=%.4f; "
-                "semantic=%.4f (min=%.4f)",
-                top_score, mean_score, semantic_score,
-                self.cfg.answerability_min_semantic_score,
-            )
-            return True
-
-        log.info(
-            "[Answerability] FAILED at semantic-evidence stage: semantic=%.4f "
-            "(min=%.4f); reranking top=%.4f, mean=%.4f",
-            semantic_score, self.cfg.answerability_min_semantic_score,
-            top_score, mean_score,
-        )
-        return False
+        return not question or self._has_query_evidence(question, score_chunks)
 
     def _web_evidence_is_relevant(self, question: str,
                                   web_candidates: list[dict]) -> bool:
@@ -560,7 +553,7 @@ class ProductionRAGPipeline:
 
     def _broader_web_retrieval(self, question: str, queries: list[str],
                                chunks: list[dict], query_type: str,
-                               limit: int) -> list[dict]:
+                               limit: int, rerank_query: Optional[str] = None) -> list[dict]:
         """Retry weak retrieval with broader web evidence before generation."""
         broader_queries = list(dict.fromkeys([
             question,
@@ -580,7 +573,7 @@ class ProductionRAGPipeline:
                 seen.add(key)
                 candidates.append(chunk)
         reranked = self.reranker.rerank_against_original(
-            question,
+            rerank_query or question,
             candidates,
             max(limit * 2, limit + 2),
             self.cfg.min_rerank_score,
@@ -598,6 +591,10 @@ class ProductionRAGPipeline:
     def __init__(self, cfg: RAGConfig) -> None:
         self.cfg = cfg
         self.db = Database(cfg.db_path)
+        self.memory = ConversationMemory(
+            self.db,
+            max_history_messages=cfg.max_history_messages,
+        )
         self.embeddings = OllamaEmbeddings(model=cfg.embed_model)
         self.llm = ChatOllama(model=cfg.llm_model, num_ctx=cfg.ctx_window)
         self.vision_llm = (
@@ -634,36 +631,6 @@ class ProductionRAGPipeline:
         log.info("[Pipeline] Setup complete — ready to query.")
         return {"ingested_files": summaries}
 
-    def create_conversation(self) -> str:
-        conversation_id = str(uuid.uuid4())
-        now = time.time()
-        with self.db.connect() as conn:
-            conn.execute(
-                "INSERT INTO conversations (id, created_at, updated_at) VALUES (?,?,?)",
-                (conversation_id, now, now),
-            )
-        return conversation_id
-
-    def _conversation_history(self, conversation_id: str) -> list[dict]:
-        with self.db.connect() as conn:
-            rows = conn.execute(
-                "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
-                (conversation_id,),
-            ).fetchall()
-        return [{"role": row["role"], "content": row["content"]} for row in rows]
-
-    def _save_message(self, conversation_id: str, role: str, content: str) -> None:
-        now = time.time()
-        with self.db.connect() as conn:
-            conn.execute(
-                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?,?,?,?)",
-                (conversation_id, role, content, now),
-            )
-            conn.execute(
-                "UPDATE conversations SET updated_at = ? WHERE id = ?",
-                (now, conversation_id),
-            )
-
     def _contextualize_query(self, question: str,
                              chat_history: Optional[list[dict | str]] = None) -> tuple[int, str, list[str]]:
         """Resolve follow-ups into a standalone query before retrieval."""
@@ -682,24 +649,46 @@ class ProductionRAGPipeline:
         original_question = question
         if conversation_id:
             chat_history = [
-                *self._conversation_history(conversation_id),
+                *self.memory.history(conversation_id),
                 *(chat_history or []),
             ]
-            self._save_message(conversation_id, "user", original_question)
+            self.memory.add_message(conversation_id, "user", original_question)
         rewrite_id, contextualized_query, rewritten_queries = self._contextualize_query(
             original_question, chat_history
         )
         question = contextualized_query
+        generation_request = (
+            self._is_generation_request(original_question)
+            or self._is_generation_request(question)
+        )
+        evidence_query = (
+            self._generation_retrieval_query(question)
+            if generation_request else question
+        )
         trace = QueryTrace(query_text=question)
         log.info("\n[Query] '%s'", question[:80])
         query_emb = self._embed_query(question)
         query_type = self._classify_query(question)
         retrieval_plan = self._route_query(question, query_type, rewritten_queries)
+        if generation_request:
+            retrieval_plan["queries"] = list(dict.fromkeys([
+                *retrieval_plan["queries"],
+                evidence_query,
+                f"{evidence_query} evidence examples documentation",
+            ]))
+            retrieval_plan["diversify"] = True
+            retrieval_plan["candidate_k"] = max(
+                retrieval_plan["candidate_k"],
+                self.cfg.top_k_rerank * 2,
+            )
         retrieval_queries = retrieval_plan["queries"]
+        rerank_query = evidence_query if generation_request else question
         log.info("[Query] Route=%s | retrieval_queries=%d | top_k=%d | web=%s",
              query_type, len(retrieval_queries), retrieval_plan["top_k"],
              retrieval_plan["always_web"])
         rewritten = "\n".join(retrieval_queries)
+        if generation_request:
+            log.info("[Query] Generation request; evidence query: %s", evidence_query)
         trace.t_rewrite = time.time()
         trace.rewritten_query = rewritten
         answer_cache_key = (
@@ -710,22 +699,12 @@ class ProductionRAGPipeline:
         cached = self.cache.get_answer(
             question, query_emb, cache_key=answer_cache_key, include_metadata=True
         )
+        cached_answer = None
+        cached_sources = []
         if cached:
-            answer, sources, critic_metadata = cached
-            multimodal_usage = self._usage_from_sources(sources, generation_mode="cached")
+            cached_answer, cached_sources, _ = cached
             trace.answer_cache_hit = True
-            trace.t_end = time.time()
-            self.metrics.record(trace)
-            if conversation_id:
-                self._save_message(conversation_id, "assistant", answer)
-            return {"answer": answer, "sources": sources, "critic": critic_metadata,
-                    "query_id": trace.query_id, "rewrite_id": rewrite_id,
-                    "rewritten_query": rewritten, "from_cache": True,
-                    "drift_alert": None,
-                    "conversation_id": conversation_id,
-                    "multimodal_usage": multimodal_usage,
-                    "metrics": {"answer_cache_hit": True, "total_ms": trace.total_ms(),
-                                "multimodal_usage": multimodal_usage}}
+            log.info("[Cache] Using cached answer as supplemental conversational context")
         cached_chunks = self.cache.get_retrieval(rewritten)
         bm25_ids: set = set()
         dense_ids: set = set()
@@ -791,7 +770,7 @@ class ProductionRAGPipeline:
             unique_candidate_count = len(all_candidates)
             # One and only one cross-encoder pass after PDF/web fusion.
             chunks = self.reranker.rerank_against_original(
-                question, all_candidates, retrieval_plan["candidate_k"], self.cfg.min_rerank_score
+                rerank_query, all_candidates, retrieval_plan["candidate_k"], self.cfg.min_rerank_score
             )
             pdf_winners = [c for c in chunks if c.get("source_type") != "web"]
             web_winners = [c for c in chunks if c.get("source_type") == "web"]
@@ -813,6 +792,7 @@ class ProductionRAGPipeline:
                     chunks,
                     query_type,
                     retrieval_plan["top_k"],
+                    rerank_query,
                 )
                 web_scrape_used = True
                 trace.t_retrieval = time.time()
@@ -857,6 +837,7 @@ class ProductionRAGPipeline:
                 chunks,
                 query_type,
                 retrieval_plan["top_k"],
+                rerank_query,
             )
             trace.t_retrieval = time.time()
             scores = [c.get("rerank_score", 0.0) for c in chunks if "rerank_score" in c]
@@ -881,6 +862,11 @@ class ProductionRAGPipeline:
         ))
 
         context = self._format_context(chunks)
+        if cached_answer:
+            cached_context = self._format_cached_answer_context(
+                cached_answer, cached_sources
+            )
+            context = f"{cached_context}\n\n[CURRENTLY RETRIEVED EVIDENCE]\n\n{context}"
         self._last_multimodal_usage = {
             "generation_mode": "not_run", "images_attached": 0, "tables_attached": 0,
         }
@@ -889,6 +875,10 @@ class ProductionRAGPipeline:
             raw_answer = self._generate_multimodal(question, context, chunks).strip()
             answer = self._sanitize_answer(raw_answer)
         else:
+            log.info(
+                "[Answerability] FAILED: %s",
+                self._answerability_debug(chunks, question),
+            )
             log.warning("[Query] Answerability gate failed; returning insufficient-information response")
             answer = self._insufficient_information_response(question)
         generated_answer = answer
@@ -970,7 +960,7 @@ class ProductionRAGPipeline:
         trace.t_end = time.time()
         self.metrics.record(trace)
         if conversation_id:
-            self._save_message(conversation_id, "assistant", answer)
+            self.memory.add_message(conversation_id, "assistant", answer)
         self.rewriter.record_answer_score(rewrite_id, faith_score)
         if faith_score >= self.cfg.rewriter_helpful_min_score:
             self.rewriter.record_feedback(rewrite_id, helpful=True)
@@ -1115,6 +1105,23 @@ class ProductionRAGPipeline:
             image_label = " | has image" if chunk.get("image_path") else ""
             parts.append(f"[Source {i} | type {source_type}{title_label} | {location} | score {score:.2f}{image_label}]\n{text}")
         return "\n\n---\n\n".join(parts)
+
+    @staticmethod
+    def _format_cached_answer_context(answer: str, sources: list[dict]) -> str:
+        source_labels = []
+        for source in sources:
+            label = source.get("title") or source.get("filename") or source.get("url")
+            if label:
+                source_labels.append(str(label))
+        source_note = (
+            "\nAssociated prior sources: " + "; ".join(dict.fromkeys(source_labels))
+            if source_labels else ""
+        )
+        return (
+            "[PRIOR CACHED ANSWER - UNVERIFIED MODEL OUTPUT; USE ONLY AS "
+            "SUPPORTING CONVERSATIONAL CONTEXT]\n\n"
+            f"Previous generated answer:\n{answer}{source_note}"
+        )
 
     def _source_provenance(self, chunk: dict, index: int) -> dict:
         source_type = chunk.get("source_type", "pdf")
