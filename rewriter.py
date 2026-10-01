@@ -46,6 +46,9 @@ Rules:
 - Do not introduce new entities, concepts, constraints, or decision criteria.
 - Do not ask about causes, benefits, limitations, components, or examples
     unless the original question asks about them.
+- Do not turn a personal preference or subjective question into a request for
+    recommendations, popularity, trends, or objective research.
+- Do not add a personal preference question to an objective research query.
 - Preserve the original intent, entities, comparison options, and constraints.
 - Do not answer the question.
 - Produce 3 to 5 distinct queries.

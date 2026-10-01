@@ -19,15 +19,27 @@ class RAGConfig:
     docs_dir: Path = field(default_factory=lambda: Path("./docs"))
     chroma_dir: Path = field(default_factory=lambda: Path("./chroma_db"))
     db_path: Path = field(default_factory=lambda: Path("./rag.db"))
+    image_store_dir: Path = field(default_factory=lambda: Path("./image_store"))
 
     # LLM
     ctx_window: int = 16384
-    max_answer_chars: int = 5000
+    max_answer_chars: int = 7000
+    max_history_messages: int = 12
+
+    # Multimodal ingestion and generation
+    multimodal_enabled: bool = True
+    vlm_model: str = "llama3.2-vision"
+    image_render_dpi: int = 144
+    image_min_drawing_count: int = 12
+    image_max_per_doc: int = 24
+    image_top_k: int = 4
+    vlm_ingest_workers: int = 2
+    vlm_generation_enabled: bool = True
 
     # Retrieval
-    top_k_dense: int = 30
-    top_k_sparse: int = 30
-    top_k_rerank: int = 15
+    top_k_dense: int = 40
+    top_k_sparse: int = 40
+    top_k_rerank: int = 25
     rrf_k: int = 60
     min_rerank_score: float = -8.0
     min_mean_rerank_score: float = 0.0
@@ -74,6 +86,7 @@ class RAGConfig:
     web_min_text_chars: int = 400
     web_min_page_quality: float = 0.45
     web_min_query_relevance: float = 0.20
+    web_min_candidates: int = 2
     web_authoritative_domains: tuple[str, ...] = (
         "cppreference.com", "cplusplus.com", "learn.microsoft.com",
         "docs.python.org", "developer.mozilla.org", "docs.oracle.com",
@@ -106,20 +119,16 @@ class RAGConfig:
     # Chunking
     chunk_size: int = 500
     chunk_overlap: int = 75
-
-    # Semantic and hierarchical chunking
     semantic_chunking_enabled: bool = True
     semantic_breakpoint_percentile: float = 90.0
     semantic_min_distance: float = 0.0
     semantic_min_block_tokens: int = 80
-
     parent_target_tokens: int = 600
     parent_max_tokens: int = 900
     child_max_tokens: int = 220
     child_overlap_tokens: int = 40
-
-    context_neighbor_count: int = 1
-    context_budget_tokens: int = 6000
+    context_neighbor_count: int = 2
+    context_budget_tokens: int = 9000
 
     # Query routing / confidence
     query_routing_enabled: bool = True
@@ -127,7 +136,8 @@ class RAGConfig:
     answerability_min_top_score: float = 0.0
     answerability_min_mean_score: float = -0.5
     answerability_min_chunks: int = 2
-    answerability_min_query_term_coverage: float = 0.70
+    answerability_score_window: int = 5
+    answerability_min_query_term_coverage: float = 0.50
     comparison_require_all_options: bool = True
     low_confidence_requires_web: bool = True
     destructive_critic_repair: bool = False

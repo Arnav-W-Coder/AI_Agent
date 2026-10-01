@@ -35,11 +35,13 @@ import pytest_asyncio
 
 from config import RAGConfig
 from db import Database
+from memory import ConversationMemory
 from cache import CacheLayer, _cosine_sim, _emb_to_bytes, _bytes_to_emb
 from metrics import MetricsRecorder, QueryTrace
 from chunking import HierarchicalChunker, ChunkRecord
 from langchain_core.documents import Document
 from url_evaluator import evaluate_url, normalize_url
+from multimodal import markdown_has_table
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,9 +138,60 @@ class TestDatabase:
             }
         expected = {
             "documents", "chunks", "query_rewrites",
-            "answer_cache", "retrieval_cache", "query_metrics", "drift_log",
+            "images", "conversations", "messages", "answer_cache", "retrieval_cache",
+            "query_metrics", "drift_log",
         }
         assert expected.issubset(tables), f"Missing tables: {expected - tables}"
+
+    @pytest.mark.layer1
+    def test_image_columns_are_available(self, db: Database):
+        with db.connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(images)")}
+            chunk_columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+        assert {"doc_id", "chroma_id", "page_number", "file_path", "caption", "markdown"}.issubset(columns)
+        assert "image_path" in chunk_columns
+
+    @pytest.mark.layer1
+    def test_markdown_table_detection(self):
+        assert markdown_has_table("| Name | Value |\n| --- | --- |\n| A | 1 |")
+        assert not markdown_has_table("A paragraph with no tabular structure.")
+
+    @pytest.mark.layer1
+    def test_conversation_messages_persist(self, db: Database):
+        import uuid
+        conversation_id = str(uuid.uuid4())
+        now = time.time()
+        with db.connect() as conn:
+            conn.execute(
+                "INSERT INTO conversations (id, created_at, updated_at) VALUES (?,?,?)",
+                (conversation_id, now, now),
+            )
+            conn.execute(
+                "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?,?,?,?)",
+                (conversation_id, "user", "Who are the characters?", now),
+            )
+            rows = conn.execute(
+                "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id",
+                (conversation_id,),
+            ).fetchall()
+        assert [(row["role"], row["content"]) for row in rows] == [
+            ("user", "Who are the characters?")
+        ]
+
+    @pytest.mark.layer1
+    def test_conversation_memory_respects_configured_history_limit(
+            self, db: Database, cfg: RAGConfig):
+        cfg.max_history_messages = 2
+        memory = ConversationMemory(db, cfg.max_history_messages)
+        conversation_id = memory.create_conversation()
+        memory.add_message(conversation_id, "user", "First")
+        memory.add_message(conversation_id, "assistant", "Second")
+        memory.add_message(conversation_id, "user", "Third")
+
+        assert memory.history(conversation_id) == [
+            {"role": "assistant", "content": "Second"},
+            {"role": "user", "content": "Third"},
+        ]
 
     @pytest.mark.layer1
     def test_document_insert_and_query(self, db: Database):
@@ -609,6 +662,62 @@ class TestCriticAndAnswerControls:
         ]) is False
 
     @pytest.mark.layer1
+    def test_answerability_mean_uses_strongest_score_window(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.answerability_min_chunks = 2
+        cfg.answerability_score_window = 2
+        cfg.answerability_min_top_score = 0.0
+        cfg.answerability_min_mean_score = 0.5
+
+        chunks = [
+            {"rerank_score": 0.9},
+            {"rerank_score": 0.8},
+            {"rerank_score": -4.0},
+            {"rerank_score": -5.0},
+        ]
+        assert instance._is_answerable(chunks) is True
+        debug = instance._answerability_debug(chunks, "")
+        assert debug["all_chunk_mean"] == pytest.approx(-1.825)
+        assert debug["strongest_chunk_mean"] == pytest.approx(0.85)
+
+    @pytest.mark.layer1
+    def test_answerability_uses_query_term_coverage(self, cfg):
+        from pipeline import ProductionRAGPipeline
+
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.answerability_min_chunks = 2
+        cfg.answerability_min_top_score = 0.0
+        cfg.answerability_min_mean_score = 0.0
+        cfg.answerability_min_query_term_coverage = 0.5
+
+        chunks = [
+            {"rerank_score": 0.8, "text": "Relevant question evidence"},
+            {"rerank_score": 0.7, "text": "More question evidence"},
+        ]
+        assert instance._is_answerable(chunks, "question") is True
+
+    @pytest.mark.layer1
+    def test_web_evidence_can_make_combined_answerable(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.answerability_min_chunks = 2
+        cfg.answerability_min_top_score = 0.7
+        cfg.answerability_min_mean_score = 0.6
+        cfg.web_min_candidates = 2
+        pdf = [{"source_type": "pdf", "rerank_score": -1.0, "text": "unrelated local text"}]
+        web = [
+            {"source_type": "web", "rerank_score": 0.9, "text": "Mona Lisa analysis and composition"},
+            {"source_type": "web", "rerank_score": 0.8, "text": "Mona Lisa symbolism and historical context"},
+        ]
+        assert instance._is_answerable(pdf, "Mona Lisa analysis") is False
+        assert instance._web_evidence_is_relevant("Mona Lisa analysis", web) is True
+        assert instance._combined_evidence_is_answerable("Mona Lisa analysis", web) is True
+
+    @pytest.mark.layer1
     def test_context_and_url_provenance_preserve_citations(self, cfg):
         from pipeline import ProductionRAGPipeline
         instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
@@ -623,6 +732,19 @@ class TestCriticAndAnswerControls:
         assert "url https://example.com/research" in context
         assert provenance["domain"] == "example.com"
         assert provenance["rerank_score"] == 0.812
+
+    @pytest.mark.layer1
+    def test_cached_answer_context_is_labeled_and_keeps_source_metadata(self):
+        from pipeline import ProductionRAGPipeline
+
+        context = ProductionRAGPipeline._format_cached_answer_context(
+            "Previously generated answer.",
+            [{"title": "RAG research"}, {"url": "https://example.com/research"}],
+        )
+
+        assert "PRIOR CACHED ANSWER - UNVERIFIED MODEL OUTPUT" in context
+        assert "Previously generated answer." in context
+        assert "RAG research; https://example.com/research" in context
 
 
 class TestQueryRewriteControls:
@@ -886,6 +1008,20 @@ class TestOriginalQuestionReranking:
         assert results[0]["text"] == "strong evidence"
 
     @pytest.mark.layer1
+    def test_generation_request_builds_evidence_query(self):
+        from pipeline import ProductionRAGPipeline
+
+        assert ProductionRAGPipeline._is_generation_request(
+            "Write an introduction for The Great Gatsby"
+        ) is True
+        assert ProductionRAGPipeline._generation_retrieval_query(
+            "Write an introductory paragraph for The Great Gatsby"
+        ) == "The Great Gatsby"
+        assert ProductionRAGPipeline._generation_retrieval_query(
+            "Implement a hybrid RAG retriever"
+        ) == "a hybrid RAG retriever"
+
+    @pytest.mark.layer1
     def test_answerability_rejects_keyword_mismatch(self, cfg):
         from pipeline import ProductionRAGPipeline
         pipeline = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
@@ -898,6 +1034,26 @@ class TestOriginalQuestionReranking:
             {"text": "Vector search ranks text chunks.", "rerank_score": -2.5},
         ]
         assert pipeline._is_answerable(chunks, "explain multimodal rag") is False
+
+    @pytest.mark.layer1
+    def test_contextualize_query_uses_chat_history(self):
+        from pipeline import ProductionRAGPipeline
+
+        class FakeRewriter:
+            def rewrite_queries(self, question, chat_history=None):
+                assert question == "Who are the characters?"
+                assert chat_history[-1]["content"] == "The Great Gatsby"
+                return 7, ["Who are the main characters in The Great Gatsby?"]
+
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.rewriter = FakeRewriter()
+        rewrite_id, standalone, queries = instance._contextualize_query(
+            "Who are the characters?",
+            [{"role": "user", "content": "The Great Gatsby"}],
+        )
+        assert rewrite_id == 7
+        assert standalone == "Who are the main characters in The Great Gatsby?"
+        assert queries == [standalone]
 
     @pytest.mark.layer1
     def test_context_expansion_preserves_original_rerank_score(self, db, cfg):
@@ -1290,8 +1446,12 @@ class TestEndToEnd:
     def test_query_returns_required_keys(self, pipeline):
         result = pipeline.query("What is the Zephyr Protocol?")
         for key in ["answer", "sources", "query_id", "rewrite_id",
-                    "rewritten_query", "from_cache", "metrics"]:
+                "rewritten_query", "from_cache", "metrics", "multimodal_usage"]:
             assert key in result, f"Missing key: {key}"
+
+        usage = result["multimodal_usage"]
+        assert {"images_retrieved", "tables_retrieved", "images_attached",
+            "tables_attached", "used_image", "used_table", "generation_mode"}.issubset(usage)
 
     def test_known_fact_appears_in_answer(self, pipeline):
         """The unique synthetic fact should appear in the answer."""

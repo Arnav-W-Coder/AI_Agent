@@ -33,7 +33,22 @@ CREATE TABLE IF NOT EXISTS chunks (
     parent_id TEXT,
     end_page INTEGER DEFAULT 0,
     section_path TEXT DEFAULT '',
+    image_path TEXT DEFAULT '',
     UNIQUE(doc_id, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS images (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_id TEXT NOT NULL REFERENCES documents(id),
+    chroma_id TEXT NOT NULL,
+    page_number INTEGER NOT NULL DEFAULT 0,
+    file_path TEXT NOT NULL,
+    caption TEXT DEFAULT '',
+    markdown TEXT DEFAULT '',
+    has_table INTEGER DEFAULT 0,
+    width INTEGER DEFAULT 0,
+    height INTEGER DEFAULT 0,
+    UNIQUE(doc_id, page_number)
 );
 
 CREATE TABLE IF NOT EXISTS query_rewrites (
@@ -44,6 +59,21 @@ CREATE TABLE IF NOT EXISTS query_rewrites (
     answer_score REAL DEFAULT NULL,
     created_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
 
 CREATE TABLE IF NOT EXISTS answer_cache (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +146,7 @@ CREATE INDEX IF NOT EXISTS idx_metrics_time ON query_metrics(created_at);
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(chunk_type);
+CREATE INDEX IF NOT EXISTS idx_images_doc ON images(doc_id);
 CREATE INDEX IF NOT EXISTS idx_rewrites_help ON query_rewrites(was_helpful);
 """
 
@@ -136,10 +167,14 @@ class Database:
                 "parent_id": "ALTER TABLE chunks ADD COLUMN parent_id TEXT",
                 "end_page": "ALTER TABLE chunks ADD COLUMN end_page INTEGER DEFAULT 0",
                 "section_path": "ALTER TABLE chunks ADD COLUMN section_path TEXT DEFAULT ''",
+                "image_path": "ALTER TABLE chunks ADD COLUMN image_path TEXT DEFAULT ''",
             }
             for name, statement in migrations.items():
                 if name not in columns:
                     conn.execute(statement)
+            image_columns = {r["name"] for r in conn.execute("PRAGMA table_info(images)").fetchall()}
+            if "has_table" not in image_columns:
+                conn.execute("ALTER TABLE images ADD COLUMN has_table INTEGER DEFAULT 0")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_parent ON chunks(parent_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(chunk_type)")
             answer_columns = {r["name"] for r in conn.execute("PRAGMA table_info(answer_cache)").fetchall()}
