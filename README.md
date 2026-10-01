@@ -1,141 +1,154 @@
-# Production-Oriented Local RAG System
+# Multimodal Production-Oriented RAG System
 
-A local-first Retrieval-Augmented Generation (RAG) system built from the ground up in Python. The project focuses on improving retrieval quality, reducing hallucinations, and making RAG pipelines more reliable and observable.
+A local-first Retrieval-Augmented Generation (RAG) system built from the ground up in Python. It combines hybrid retrieval, hierarchical chunking, multimodal document understanding, conversational memory, grounded generation, and automated response validation.
+
+The system is designed to go beyond a basic **vector database + LLM** pipeline by treating retrieval quality, document structure, visual information, context management, and answer reliability as separate engineering problems.
 
 ## Architecture
 
 ```text
-                         User Query
-                              │
-                              ▼
-                  Query Classification
-                    + Query Rewriting
-                              │
-                              ▼
-                    Retrieval Planning
-                              │
-                 ┌────────────┴────────────┐
-                 ▼                         ▼
-              BM25 Search           Dense Retrieval
-                 │                    (ChromaDB)
-                 └────────────┬────────────┘
-                              ▼
-                    Reciprocal Rank Fusion
-                              │
-                              ▼
-                     Cross-Encoder Rerank
-                              │
-                              ▼
-                    Parent Context Expansion
-                              │
-                              ▼
-                       Answerability
-                              │
-                    ┌─────────┴─────────┐
-                    ▼                   ▼
-                 Sufficient        Web Fallback
-                    │                   │
-                    └─────────┬─────────┘
-                              ▼
-                       Local LLM (Ollama)
-                              │
-                              ▼
-                     Critic / Grounding
-                              │
-                    ┌─────────┴─────────┐
-                    ▼                   ▼
-                   Pass            Repair / Abstain
-                    │                   │
-                    └─────────┬─────────┘
-                              ▼
-                         Final Answer
+                              User Query
+                                  │
+                                  ▼
+                    Conversation Context / Memory
+                                  │
+                                  ▼
+                     Query Classification + Rewrite
+                                  │
+                                  ▼
+                        Retrieval Planning
+                                  │
+                    ┌─────────────┴─────────────┐
+                    ▼                           ▼
+              BM25 Retrieval             Dense Retrieval
+                    │                      ChromaDB
+                    └─────────────┬─────────────┘
+                                  ▼
+                         RRF Rank Fusion
+                                  │
+                                  ▼
+                       Cross-Encoder Rerank
+                                  │
+                                  ▼
+                       Context Expansion
+                                  │
+                                  ▼
+                         Answerability Check
+                                  │
+                         ┌────────┴────────┐
+                         ▼                 ▼
+                      Local           Web Retrieval
+                      Evidence         / Fallback
+                         │                 │
+                         └────────┬────────┘
+                                  ▼
+                         Text + Visual Context
+                                  │
+                                  ▼
+                         Ollama LLM / VLM
+                                  │
+                                  ▼
+                       Critic + Grounding Check
+                                  │
+                         ┌────────┴────────┐
+                         ▼                 ▼
+                        Pass          Repair / Abstain
+                                  │
+                                  ▼
+                             Final Answer
 ```
 
 ## Key Features
 
 ### Hybrid Retrieval
+Combines **BM25 lexical search** and **dense vector retrieval**, then merges their rankings with **Reciprocal Rank Fusion (RRF)** before cross-encoder reranking.
 
-Combines **BM25 lexical search** and **dense vector retrieval**, then merges their rankings using **Reciprocal Rank Fusion (RRF)**.
+### Hierarchical Semantic Chunking
+Documents are split into retrieval-sized child chunks while preserving larger parent chunks and neighboring context for generation.
 
-### Cross-Encoder Reranking
+### Multimodal RAG
+PDF pages containing meaningful images, tables, charts, or dense vector drawings are rendered and processed by a vision-language model. The VLM produces:
 
-Retrieved candidates are scored using a cross-encoder to select the most relevant context before generation.
+- Image captions
+- Markdown representations of visible content and tables
 
-### Hierarchical Chunking
+These textual representations are embedded for retrieval while the original rendered images are stored separately and supplied to the vision-capable LLM when visual evidence is relevant.
 
-Documents are split into small retrieval-oriented child chunks while maintaining larger parent chunks for contextual generation.
+```text
+PDF Page
+   │
+   ├── Text ───────────────► Semantic Chunking ──► Vector Store
+   │
+   └── Image / Table
+            │
+            ▼
+       Page Rendering
+            │
+            ▼
+       Vision-Language Model
+            │
+       ┌────┴────┐
+       ▼         ▼
+    Caption   Markdown
+       │         │
+       └────┬────┘
+            ▼
+       Vector Store
+            │
+            └────► Original Image ──► Multimodal Generation
+```
+
+### Conversational Memory
+Short-term conversation history is persisted in SQLite and used during query rewriting and retrieval, allowing follow-up questions to retain context from previous turns.
 
 ### Adaptive Query Processing
+Queries are classified and rewritten before retrieval, allowing the pipeline to adapt retrieval behavior for research, comparisons, troubleshooting, recommendations, and other query types.
 
-Queries are classified and rewritten before retrieval, allowing different retrieval strategies for research, comparisons, troubleshooting, recommendations, and other query types.
-
-### Grounded Generation
-
-The LLM is constrained to retrieved evidence, with **answerability checks** used to determine whether enough information exists to answer confidently.
-
-### Critic & Repair
-
-Generated responses are evaluated for grounding, relevance, and completeness. Unsupported responses can be repaired using the retrieved evidence or rejected.
+### Grounded Generation & Repair
+The pipeline evaluates whether retrieved evidence is sufficient before generation. Generated responses are then checked for unsupported claims and can be repaired or rejected when grounding fails.
 
 ### Production-Oriented Infrastructure
+- Asynchronous PDF ingestion and batched embeddings
+- Hash-based incremental document updates
+- Persistent ChromaDB + SQLite storage
+- Retrieval and answer caching
+- Web retrieval with source-quality filtering
+- Retrieval, latency, and grounding metrics
+- Deterministic multimodal pipeline tests
 
-Includes:
-
-* Asynchronous PDF ingestion
-* Batched embeddings
-* Hash-based incremental document updates
-* Retrieval and answer caching
-* SQLite-backed metrics
-* Retrieval and latency monitoring
-* Optional web retrieval and fallback
-
-## Document Pipeline
+## Document Ingestion
 
 ```text
 PDF
  │
- ▼
-Structure-Aware Chunking
+ ├── Text ──► Hierarchical Chunking ──► Embeddings ──► ChromaDB / BM25
  │
- ├── Parent Chunks ──► SQLite
- │
- └── Child Chunks
-          │
-          ▼
-     Embeddings
-          │
-          ▼
-       ChromaDB
-          │
-          └──► BM25 Index
+ └── Visual Pages ──► VLM Caption + Markdown ──► Embeddings ──► ChromaDB
+                                  │
+                                  └── Original Image ──► Image Store
 ```
 
-Only retrieval-sized child chunks are indexed, while parent chunks preserve additional context for generation.
+Documents are identified by file hash so unchanged files can be skipped and modified documents can be re-indexed without rebuilding the entire corpus.
 
 ## Tech Stack
 
-* **Python**
-* **LangChain**
-* **Ollama**
-* **ChromaDB**
-* **SQLite**
-* **BM25 / rank_bm25**
-* **Sentence Transformers**
-* **PyMuPDF / PyPDF**
-* **BeautifulSoup / DDGS**
+- **Python**
+- **LangChain**
+- **Ollama** — LLM, embedding, and vision inference
+- **ChromaDB** — vector retrieval
+- **SQLite** — chunks, images, conversations, cache, and metrics
+- **BM25 / rank_bm25** — lexical retrieval
+- **Sentence Transformers** — cross-encoder reranking
+- **PyMuPDF / PyPDF** — PDF processing and page rendering
+- **BeautifulSoup / DDGS** — web retrieval
 
 ## Getting Started
 
-### 1. Clone the repository
+### 1. Clone and install
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Arnav-W-Coder/AI_Agent.git
 cd AI_Agent
-```
-
-### 2. Create a virtual environment
-
-```bash
 python -m venv .venv
 ```
 
@@ -151,30 +164,25 @@ macOS/Linux:
 source .venv/bin/activate
 ```
 
-### 3. Install dependencies
-
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Install local models
+### 2. Install Ollama models
 
-This project uses Ollama for local LLM inference and embeddings.
+The default local models are:
 
 ```bash
 ollama pull llama3.2
 ollama pull nomic-embed-text
+ollama pull llama3.2-vision
 ```
 
-### 5. Add documents
+### 3. Add documents
 
-Place PDF files in the configured `docs/` directory.
+Place PDF files in the configured `docs/` directory. The ingestion pipeline automatically processes new or modified documents and indexes both textual and visual evidence.
 
-The ingestion pipeline automatically detects new or modified documents and updates the index.
-
-### 6. Run
-
-Use the project's main entry point:
+### 4. Run
 
 ```bash
 python main.py
@@ -184,30 +192,32 @@ python main.py
 
 ```text
 AI_Agent/
-├── config.py          # Configuration
+├── config.py          # Central configuration
 ├── pipeline.py        # RAG orchestration
-├── ingestion.py       # Document ingestion
-├── chunking.py        # Semantic chunking
+├── ingestion.py       # PDF + multimodal ingestion
+├── multimodal.py      # Page extraction and VLM captioning
+├── chunking.py        # Hierarchical semantic chunking
 ├── retrieval.py       # Hybrid retrieval + reranking
 ├── rewriter.py        # Query rewriting
-├── critic.py          # Grounding + repair
-├── cache.py           # Caching
-├── metrics.py         # Monitoring
+├── memory.py          # SQLite conversation memory
+├── critic.py          # Grounding and response repair
+├── cache.py           # Retrieval / answer caching
+├── metrics.py         # Observability and metrics
 ├── db.py              # SQLite persistence
-├── web_store.py       # Web retrieval
+├── web_store.py       # Web evidence retrieval
 └── main.py            # Application entry point
 ```
 
 ## Project Goals
 
-This project explores how to build a RAG system beyond the basic **"vector database + LLM"** architecture.
+This project explores how to build RAG systems beyond the basic **"vector database + LLM"** pattern, with an emphasis on:
 
-The primary focus is:
-
-* Improving retrieval precision
-* Preserving document context
-* Detecting insufficient evidence
-* Reducing unsupported generation
-* Making RAG systems measurable and maintainable
+- High-quality hybrid retrieval
+- Preserving document and visual context
+- Conversational query understanding
+- Evidence-aware generation
+- Hallucination detection and repair
+- Local inference and data ownership
+- Measurable, maintainable AI infrastructure
 
 Built independently as an AI engineering project.
