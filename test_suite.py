@@ -178,6 +178,8 @@ class TestDatabase:
         assert cfg.adaptive_web_max_rounds <= 2
         assert cfg.context_budget_tokens <= 5000
         assert cfg.return_validated_answer_cache is True
+        assert cfg.answerability_semantic_override_enabled is True
+        assert cfg.answerability_semantic_override_top_score >= 1.0
 
     @pytest.mark.layer1
     def test_markdown_table_detection(self):
@@ -992,6 +994,58 @@ class TestAnswerabilityLexicalNormalization:
         )
         assert coverage >= cfg.answerability_min_query_term_coverage
         assert {"liquid", "incompressible"}.issubset(matched)
+
+
+class TestSemanticAnswerabilityOverride:
+    """Strong semantic rerank evidence may pass despite imperfect lexical wording."""
+
+    @pytest.mark.layer1
+    def test_strong_semantic_scores_override_partial_lexical_coverage(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        chunks = [
+            {
+                "text": "An incompressible fluid changes volume very little under pressure.",
+                "rerank_score": 1.65,
+            },
+            {
+                "text": "Gases are compressible, while liquids are commonly treated as incompressible.",
+                "rerank_score": 1.46,
+            },
+            {
+                "text": "Water is a liquid and is often modeled as incompressible.",
+                "rerank_score": 0.64,
+            },
+        ]
+        assert instance._is_answerable(
+            chunks, "why isn't air a incompressible fluid but water and oil are"
+        ) is True
+        debug = instance._answerability_debug(
+            chunks, "why isn't air a incompressible fluid but water and oil are"
+        )
+        assert debug["semantic_override_pass"] is True
+        assert debug["answerable_pass"] is True
+
+    @pytest.mark.layer1
+    def test_weak_semantic_scores_do_not_override_low_coverage(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        chunks = [
+            {"text": "Unrelated cooking instructions.", "rerank_score": 0.2},
+            {"text": "Another unrelated paragraph.", "rerank_score": 0.1},
+        ]
+        assert instance._is_answerable(
+            chunks, "why isn't air a incompressible fluid but water and oil are"
+        ) is False
+
+    @pytest.mark.layer1
+    def test_natural_but_contrast_routes_as_comparison(self):
+        from pipeline import ProductionRAGPipeline
+        assert ProductionRAGPipeline._classify_query(
+            "why isn't air a incompressible fluid but water and oil are"
+        ) == "comparison"
 
 
 class TestAdaptiveLatencyControls:

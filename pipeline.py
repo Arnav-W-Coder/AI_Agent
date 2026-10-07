@@ -163,8 +163,13 @@ class ProductionRAGPipeline:
         if any(marker in text for marker in ("stack trace", "traceback", "error:",
                                               "exception", "not working", "fails", "failure")):
             return "troubleshooting"
-        if any(marker in text for marker in ("compare ", "comparison", " versus ", " vs ",
-                                              "differences between", "which is better")):
+        if any(marker in text for marker in (
+            "compare ", "comparison", " versus ", " vs ",
+            "differences between", "which is better", " whereas ",
+        )) or (
+            " but " in text
+            and any(marker in text for marker in ("why ", "how ", "isn't", "isnt", "aren't", "arent"))
+        ):
             return "comparison"
         if any(word in words for word in ("best", "recommend", "recommendation", "alternatives")):
             return "recommendation"
@@ -280,9 +285,20 @@ class ProductionRAGPipeline:
         elif query_type == "how_to":
             plan["queries"] = [f"{query} documentation reference guide" for query in plan["queries"]]
         elif query_type == "comparison":
-            plan["queries"].extend(f"{option} {question}" for option in self._named_options(question))
+            # Keep natural contrast questions cheap: the original query usually
+            # contains all compared entities, so source diversification matters
+            # more than generating many paraphrases.
+            options = self._named_options(question)
+            if options:
+                plan["queries"].extend(
+                    f"{option} {question}" for option in options[:2]
+                )
+            plan["queries"] = list(dict.fromkeys(plan["queries"]))[:3]
             plan["diversify"] = True
-            plan["candidate_k"] = max(self.cfg.top_k_rerank * 2, self.cfg.top_k_rerank + 2)
+            plan["candidate_k"] = max(
+                self.cfg.top_k_rerank + 4,
+                min(self.cfg.top_k_rerank * 2, 12),
+            )
         elif query_type == "recommendation":
             if self.cfg.recommendation_query_expansion_enabled:
                 plan["queries"] = self._recommendation_queries(question, plan["queries"])
@@ -427,10 +443,27 @@ class ProductionRAGPipeline:
         coverage, query_terms, matched_terms = self._query_evidence_coverage(
             question, score_chunks
         )
+        top_score = scores[0] if scores else None
+        lexical_pass = (
+            coverage >= self.cfg.answerability_min_query_term_coverage
+        )
+        semantic_override_pass = bool(
+            getattr(self.cfg, "answerability_semantic_override_enabled", True)
+            and top_score is not None
+            and top_score >= getattr(
+                self.cfg, "answerability_semantic_override_top_score", 1.0
+            )
+            and mean_score >= getattr(
+                self.cfg, "answerability_semantic_override_mean_score", 0.0
+            )
+            and coverage >= getattr(
+                self.cfg, "answerability_semantic_override_min_coverage", 0.20
+            )
+        )
         return {
             "chunk_count": len(chunks),
             "scoreable_chunk_count": len(score_chunks),
-            "top_score": scores[0] if scores else None,
+            "top_score": top_score,
             "all_chunk_mean": sum(scores) / len(scores) if scores else None,
             "strongest_chunk_mean": mean_score,
             "query_terms": sorted(query_terms),
@@ -443,8 +476,14 @@ class ProductionRAGPipeline:
             "mean_score_pass": (
                 mean_score >= self.cfg.answerability_min_mean_score
             ),
-            "query_evidence_pass": self._has_query_evidence(
-                question, score_chunks
+            "query_evidence_pass": lexical_pass,
+            "semantic_override_pass": semantic_override_pass,
+            "answerable_pass": bool(
+                len(score_chunks) >= self.cfg.answerability_min_chunks
+                and scores
+                and scores[0] >= self.cfg.answerability_min_top_score
+                and mean_score >= self.cfg.answerability_min_mean_score
+                and (lexical_pass or semantic_override_pass)
             ),
         }
 
@@ -479,7 +518,29 @@ class ProductionRAGPipeline:
         if not scoreable:
             return False
 
-        return not question or self._has_query_evidence(question, score_chunks)
+        if not question:
+            return True
+
+        coverage, _, _ = self._query_evidence_coverage(question, score_chunks)
+        if coverage >= self.cfg.answerability_min_query_term_coverage:
+            return True
+
+        # The cross-encoder is the semantic relevance model; lexical overlap is
+        # only a guardrail. Allow strong semantic evidence through when there is
+        # still some query-term overlap, rather than forcing exact wording.
+        semantic_override = bool(
+            getattr(self.cfg, "answerability_semantic_override_enabled", True)
+            and top_score >= getattr(
+                self.cfg, "answerability_semantic_override_top_score", 1.0
+            )
+            and mean_score >= getattr(
+                self.cfg, "answerability_semantic_override_mean_score", 0.0
+            )
+            and coverage >= getattr(
+                self.cfg, "answerability_semantic_override_min_coverage", 0.20
+            )
+        )
+        return semantic_override
 
     def _web_evidence_is_relevant(self, question: str,
                                   web_candidates: list[dict]) -> bool:
@@ -1333,6 +1394,7 @@ class ProductionRAGPipeline:
                 "retrieval_cached": trace.retrieval_cache_hit,
                 "query_type": query_type,
                 "answerable": answerable,
+                "answerability_debug": self._answerability_debug(chunks, question),
                 "low_confidence": low_confidence,
                 "web_scrape_used": web_scrape_used,
                 "adaptive_web": dict(self._last_adaptive_web_usage),

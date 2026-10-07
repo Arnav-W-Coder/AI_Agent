@@ -167,6 +167,13 @@ class RAGConfig:
     answerability_min_chunks: int = 2
     answerability_score_window: int = 5
     answerability_min_query_term_coverage: float = 0.50
+    # A strong cross-encoder signal may override incomplete literal term coverage.
+    # This prevents semantically relevant evidence (e.g. "gas" vs "air") from
+    # being rejected solely because wording differs.
+    answerability_semantic_override_enabled: bool = True
+    answerability_semantic_override_top_score: float = 1.0
+    answerability_semantic_override_mean_score: float = 0.0
+    answerability_semantic_override_min_coverage: float = 0.20
     comparison_require_all_options: bool = True
     low_confidence_requires_web: bool = True
     destructive_critic_repair: bool = False
