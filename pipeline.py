@@ -182,6 +182,24 @@ class ProductionRAGPipeline:
     """Wire ingestion, retrieval, generation, evaluation, and monitoring."""
 
     @staticmethod
+    def _is_practice_request(question: str) -> bool:
+        """Recognize common study-artifact wording with lightweight regexes."""
+        text = re.sub(r"\s+", " ", (question or "").lower()).strip()
+        patterns = (
+            r"\bpractice(?:\s+test)?\s+(?:problems?|questions?)\b",
+            r"\bpractice\s+tests?\b",
+            r"\bmock\s+(?:exam|test)(?:\s+(?:problems?|questions?))?\b",
+            r"\b(?:final|midterm|exam|test)\s+review\s+(?:problems?|questions?)\b",
+            r"\breview\s+(?:problems?|questions?)\b",
+            r"\bquiz(?:zes)?\b",
+            r"\bworksheets?\b",
+            r"\bflashcards?\b",
+            r"\bstudy\s+guides?\b",
+            r"\bexercises?\b",
+        )
+        return any(re.search(pattern, text) for pattern in patterns)
+
+    @staticmethod
     def _classify_query(question: str) -> str:
         """Classify query intent using inexpensive lexical signals."""
         text = question.strip().lower()
@@ -197,11 +215,7 @@ class ProductionRAGPipeline:
             and any(marker in text for marker in ("why ", "how ", "isn't", "isnt", "aren't", "arent"))
         ):
             return "comparison"
-        if any(phrase in text for phrase in (
-            "practice problem", "practice problems", "practice question",
-            "practice questions", "quiz", "worksheet", "flashcard",
-            "flashcards", "study guide", "review questions", "exercises",
-        )):
+        if ProductionRAGPipeline._is_practice_request(question):
             return "practice"
         if any(word in words for word in ("best", "recommend", "recommendation", "alternatives")):
             return "recommendation"
@@ -236,16 +250,10 @@ class ProductionRAGPipeline:
         # "Give/make me ..." is only generation when it targets an artifact.
         # This avoids treating ordinary requests such as "give me information"
         # as artifact-generation queries.
-        text = question.lower()
-        artifact_markers = (
-            "practice problem", "practice problems", "practice question",
-            "practice questions", "quiz", "worksheet", "flashcard",
-            "flashcards", "study guide", "review questions", "exercises",
-        )
         soft_generation_verbs = {"give", "make"}
         return (
             any(word in soft_generation_verbs for word in words[:4])
-            and any(marker in text for marker in artifact_markers)
+            and ProductionRAGPipeline._is_practice_request(question)
         )
 
     @staticmethod
@@ -271,8 +279,11 @@ class ProductionRAGPipeline:
         query = re.sub(
             r"^(?:give|make|create|generate|write|prepare)\s+(?:me\s+)?"
             r"(?:(?:some|a|an|the)\s+)?"
-            r"(?:practice\s+(?:problems?|questions?)|quiz(?:zes)?|worksheet|"
-            r"flashcards?|exercises?|study\s+guide|review\s+questions?)\s+"
+            r"(?:practice(?:\s+test)?\s+(?:problems?|questions?)|practice\s+tests?|"
+            r"mock\s+(?:exam|test)(?:\s+(?:problems?|questions?))?|"
+            r"(?:final|midterm|exam|test)\s+review\s+(?:problems?|questions?)|"
+            r"quiz(?:zes)?|worksheets?|flashcards?|exercises?|study\s+guides?|"
+            r"review\s+(?:problems?|questions?))\s+"
             r"(?:for|about|on|of)\s+",
             "",
             query,
@@ -288,8 +299,10 @@ class ProductionRAGPipeline:
         query = re.sub(
             r"^(?:me\s+)?(?:a|an|the)?\s*(?:potential\s+)?"
             r"(?:introductory paragraph|introduction|essay|email|story|report|"
-            r"implementation|study plan|study guide|practice problems?|"
-            r"practice questions?|quiz(?:zes)?|worksheet|flashcards?|exercises?|"
+            r"implementation|study plan|study guides?|practice(?: test)? problems?|"
+            r"practice(?: test)? questions?|practice tests?|mock (?:exam|test)|"
+            r"(?:final|midterm|exam|test) review (?:problems?|questions?)|"
+            r"quiz(?:zes)?|worksheets?|flashcards?|exercises?|"
             r"architecture|summary|translation|refactor|design|solution|piece of code)\s+"
             r"(?:for|about|on|of)\s+",
             "",
