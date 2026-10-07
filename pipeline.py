@@ -305,10 +305,12 @@ class ProductionRAGPipeline:
     @staticmethod
     def _diversify_sources(chunks: list[dict], query_type: str, limit: int,
                            max_per_source: int = 2, max_per_domain: int = 3) -> list[dict]:
-        """Select relevant chunks while preserving independent sources."""
-        if query_type not in {"comparison", "recommendation", "research", "multi_constraint"}:
-            return chunks[:limit]
+        """Select relevant chunks while limiting redundant evidence.
 
+        Even simple questions should not spend context budget on many near-duplicate
+        chunks from the same URL. Complex queries still receive stronger domain
+        diversification through the unseen-domain preference below.
+        """
         remaining = sorted(chunks, key=stable_chunk_sort_key)
         selected = []
         source_counts: dict[str, int] = {}
@@ -326,12 +328,14 @@ class ProductionRAGPipeline:
                 break
 
             best_score = eligible[0][0].get("rerank_score", 0.0)
-            unseen_domain = next(
-                (item for item in eligible
-                 if domain_counts.get(item[2], 0) == 0
-                 and best_score - item[0].get("rerank_score", 0.0) <= score_tolerance),
-                None,
-            )
+            unseen_domain = None
+            if query_type in {"comparison", "recommendation", "research", "multi_constraint"}:
+                unseen_domain = next(
+                    (item for item in eligible
+                     if domain_counts.get(item[2], 0) == 0
+                     and best_score - item[0].get("rerank_score", 0.0) <= score_tolerance),
+                    None,
+                )
             chunk, source, domain = unseen_domain or eligible[0]
             selected.append(chunk)
             source_counts[source] = source_counts.get(source, 0) + 1
@@ -484,6 +488,14 @@ class ProductionRAGPipeline:
     def _insufficient_information_response(question: str) -> str:
         return CANONICAL_INSUFFICIENT_INFO_RESPONSE
 
+    def _should_run_critic(self, *, low_confidence: bool, answerable: bool) -> bool:
+        """Respect the configured critic fast path for high-confidence answers."""
+        if not self.cfg.critic_enabled:
+            return False
+        if not self.cfg.critic_on_low_confidence_only:
+            return True
+        return bool(low_confidence or not answerable)
+
     @staticmethod
     def _sanitize_answer(text: str) -> str:
         """Strip hidden reasoning/label wrappers without touching anything else.
@@ -568,35 +580,110 @@ class ProductionRAGPipeline:
     def _broader_web_retrieval(self, question: str, queries: list[str],
                                chunks: list[dict], query_type: str,
                                limit: int, rerank_query: Optional[str] = None) -> list[dict]:
-        """Retry weak retrieval with broader web evidence before generation."""
-        broader_queries = list(dict.fromkeys([
+        """Adaptive web fallback: fetch a small batch, re-check, then fetch more only if needed."""
+        search_queries = list(dict.fromkeys([
             question,
             *queries,
-            f"{question} authoritative sources evidence",
+            f"{question} authoritative source evidence",
         ]))
-        workers = max(1, min(len(broader_queries), int(self.cfg.web_fetch_workers)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self._web_scrape_chunks, query) for query in broader_queries]
-            web_chunks = [chunk for future in futures for chunk in future.result()]
+        current = list(chunks)
+        seen_urls = {
+            chunk.get("source_url") or chunk.get("filename")
+            for chunk in current
+            if chunk.get("source_type") == "web"
+            and (chunk.get("source_url") or chunk.get("filename"))
+        }
 
-        candidates = []
-        seen = set()
-        for chunk in [*chunks, *web_chunks]:
-            key = f"{chunk.get('source_type', 'pdf')}:{chunk.get('chroma_id') or chunk.get('source_url', chunk.get('filename', ''))}:{chunk.get('text', '')[:100]}"
-            if key not in seen:
-                seen.add(key)
-                candidates.append(chunk)
-        reranked = self.reranker.rerank_against_original(
-            rerank_query or question,
-            candidates,
-            max(limit * 2, limit + 2),
-            self.cfg.min_rerank_score,
+        adaptive = bool(getattr(self.cfg, "adaptive_web_enabled", True))
+        max_rounds = (
+            max(1, int(getattr(self.cfg, "adaptive_web_max_rounds", 2)))
+            if adaptive else 1
         )
-        pdf_winners = [chunk for chunk in reranked if chunk.get("source_type") != "web"]
-        web_winners = [chunk for chunk in reranked if chunk.get("source_type") == "web"]
-        expanded_pdf = self.retriever.expand_to_context(pdf_winners)
-        recovered = sorted(expanded_pdf + web_winners, key=stable_chunk_sort_key)
-        return self._diversify_sources(recovered, query_type, limit)
+        initial_sources = max(
+            1, int(getattr(self.cfg, "adaptive_web_initial_sources", 2))
+        )
+        per_round_sources = max(
+            1, int(getattr(self.cfg, "adaptive_web_sources_per_round", 2))
+        )
+        hard_cap = max(1, int(self.cfg.max_scrape_urls))
+        network_sources = 0
+        rounds = 0
+        stop_reason = "max_rounds"
+        started = time.perf_counter()
+
+        for round_index in range(max_rounds):
+            if network_sources >= hard_cap:
+                stop_reason = "source_cap"
+                break
+
+            requested = (
+                initial_sources if round_index == 0 else per_round_sources
+            )
+            requested = min(requested, hard_cap - network_sources)
+            if requested <= 0:
+                stop_reason = "source_cap"
+                break
+
+            search_query = search_queries[min(round_index, len(search_queries) - 1)]
+            web_chunks = self._web_scrape_chunks(
+                search_query,
+                max_urls=requested,
+                exclude_urls=seen_urls,
+            )
+            rounds += 1
+            scrape_stats = getattr(self, "_last_web_scrape_stats", {})
+            fetched_urls = scrape_stats.get("fetched_urls", [])
+            network_sources += len(fetched_urls)
+            seen_urls.update(fetched_urls)
+
+            candidates = []
+            seen = set()
+            for chunk in [*current, *web_chunks]:
+                key = (
+                    f"{chunk.get('source_type', 'pdf')}:"
+                    f"{chunk.get('chroma_id') or chunk.get('source_url', chunk.get('filename', ''))}:"
+                    f"{chunk.get('text', '')[:100]}"
+                )
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(chunk)
+
+            if not candidates:
+                stop_reason = "no_candidates"
+                break
+
+            reranked = self.reranker.rerank_against_original(
+                rerank_query or question,
+                candidates,
+                max(limit * 2, limit + 2),
+                self.cfg.min_rerank_score,
+            )
+            pdf_winners = [
+                chunk for chunk in reranked if chunk.get("source_type") != "web"
+            ]
+            web_winners = [
+                chunk for chunk in reranked if chunk.get("source_type") == "web"
+            ]
+            expanded_pdf = self.retriever.expand_to_context(pdf_winners)
+            recovered = sorted(expanded_pdf + web_winners, key=stable_chunk_sort_key)
+            current = self._diversify_sources(recovered, query_type, limit)
+
+            if self._combined_evidence_is_answerable(question, current):
+                stop_reason = "answerable"
+                break
+            if not fetched_urls:
+                stop_reason = "no_new_sources"
+                break
+
+        self._last_adaptive_web_usage = {
+            "enabled": adaptive,
+            "rounds": rounds,
+            "network_sources": network_sources,
+            "stop_reason": stop_reason,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+        }
+        log.info("[AdaptiveWeb] %s", self._last_adaptive_web_usage)
+        return current
 
     def __init__(self, cfg: RAGConfig) -> None:
         self.cfg = cfg
@@ -642,6 +729,15 @@ class ProductionRAGPipeline:
         self._last_multimodal_usage = {
             "generation_mode": "not_run", "images_attached": 0, "tables_attached": 0,
         }
+        self._last_adaptive_web_usage = {
+            "enabled": bool(getattr(cfg, "adaptive_web_enabled", True)),
+            "rounds": 0, "network_sources": 0,
+            "stop_reason": "not_run", "elapsed_ms": 0.0,
+        }
+        self._last_web_scrape_stats = {
+            "query": "", "requested_urls": 0, "fetched_urls": [],
+            "new_chunks": 0,
+        }
 
     async def setup(self) -> dict:
         log.info("=" * 60)
@@ -672,6 +768,7 @@ class ProductionRAGPipeline:
               conversation_id: Optional[str] = None) -> dict:
         assert self.retriever is not None, "Call await setup() before query()."
         original_question = question
+        trace = QueryTrace(query_text=original_question)
         if conversation_id:
             chat_history = [
                 *self.memory.history(conversation_id),
@@ -690,7 +787,7 @@ class ProductionRAGPipeline:
             self._generation_retrieval_query(question)
             if generation_request else question
         )
-        trace = QueryTrace(query_text=question)
+        trace.query_text = question
         log.info("\n[Query] '%s'", question[:80])
         query_emb = self._embed_query(question)
         query_type = self._classify_query(question)
@@ -743,28 +840,22 @@ class ProductionRAGPipeline:
             trace.retrieval_cache_hit = True
             trace.t_retrieval = trace.t_rerank = time.time()
         else:
-            log.info("[Query] Starting PDF + web retrieval...")
-            outer_workers = max(2, int(self.cfg.web_fetch_workers) + 1)
-            with ThreadPoolExecutor(max_workers=outer_workers) as pool:
+            log.info("[Query] Starting local retrieval...")
+            pdf_workers = max(1, min(len(retrieval_queries), 4))
+            with ThreadPoolExecutor(max_workers=pdf_workers) as pool:
                 pdf_futures = {
                     pool.submit(self.retriever.retrieve_candidates, query, metadata_filter): query
                     for query in retrieval_queries
                 }
-                web_futures = ({
-                    pool.submit(self._web_scrape_chunks, query): query
-                    for query in retrieval_queries
-                } if use_web_fallback and retrieval_plan["always_web"] else {})
                 pdf_results = [future.result() for future in pdf_futures]
-                web_results = [future.result() for future in web_futures]
 
                 for index, query in enumerate(retrieval_queries):
                     pdf_count = len(pdf_results[index][0]) if index < len(pdf_results) else 0
-                    web_count = len(web_results[index]) if index < len(web_results) else 0
                     retrieval_calls.append({
                         "query": query,
                         "pdf_candidates": pdf_count,
-                        "web_candidates": web_count,
-                        "candidates": pdf_count + web_count,
+                        "web_candidates": 0,
+                        "candidates": pdf_count,
                     })
 
             pdf_candidates = []
@@ -774,8 +865,8 @@ class ProductionRAGPipeline:
                 pdf_candidates.extend(candidates)
                 bm25_ids.update(query_bm25_ids)
                 dense_ids.update(query_dense_ids)
-            web_chunks = [chunk for results in web_results for chunk in results]
-            web_scrape_used = bool(web_futures)
+            web_chunks = []
+            web_scrape_used = False
             trace.t_retrieval = time.time()
 
             seen = set()
@@ -809,8 +900,17 @@ class ProductionRAGPipeline:
             web_evidence = [chunk for chunk in combined_chunks if chunk.get("source_type") == "web"]
             pdf_answerable = self._combined_evidence_is_answerable(question, pdf_evidence)
             combined_answerable = self._combined_evidence_is_answerable(question, combined_chunks)
-            if use_web_fallback and not retrieval_plan["always_web"] and not pdf_answerable and not combined_answerable:
-                log.info("[Query] Local sources failed answerability; using web fallback")
+            need_adaptive_web = (
+                use_web_fallback
+                and (retrieval_plan["always_web"] or not combined_answerable)
+            )
+            if need_adaptive_web:
+                log.info(
+                    "[Query] %s; starting adaptive web retrieval",
+                    "Route requires web evidence"
+                    if retrieval_plan["always_web"]
+                    else "Local sources failed answerability",
+                )
                 chunks = self._broader_web_retrieval(
                     question,
                     retrieval_queries,
@@ -819,7 +919,9 @@ class ProductionRAGPipeline:
                     retrieval_plan["top_k"],
                     rerank_query,
                 )
-                web_scrape_used = True
+                web_scrape_used = (
+                    self._last_adaptive_web_usage.get("rounds", 0) > 0
+                )
                 trace.t_retrieval = time.time()
                 trace.t_rerank = time.time()
 
@@ -874,7 +976,9 @@ class ProductionRAGPipeline:
             trace.mean_rerank_score = round(sum(scores) / len(scores), 4) if scores else 0.0
             trace.top_rerank_score = max(scores) if scores else 0.0
             trace.t_rerank = time.time()
-            web_scrape_used = True
+            web_scrape_used = (
+                self._last_adaptive_web_usage.get("rounds", 0) > 0
+            )
 
         log.info(self._retrieval_debug_summary(
             question,
@@ -914,9 +1018,20 @@ class ProductionRAGPipeline:
         critic_result = {
             "verdict": "PASS", "severity": "none", "critique": "",
         }
-        repair_mode = "critic_disabled"
+        critic_ran = False
+        should_run_critic = self._should_run_critic(
+            low_confidence=low_confidence,
+            answerable=answerable,
+        )
+        repair_mode = (
+            "critic_disabled"
+            if not self.cfg.critic_enabled
+            else "skipped_high_confidence"
+        )
         repair_attempts = 0
-        if self.cfg.critic_enabled:
+        critic_started = time.perf_counter()
+        if should_run_critic:
+            critic_ran = True
             critic_result = self.critic.evaluate(question, answer, evidence_context)
             repair_mode = "none"
             max_attempts = max(0, int(self.cfg.critic_max_repair_attempts))
@@ -950,8 +1065,12 @@ class ProductionRAGPipeline:
             log.info("[Query] Critic verdict=%s severity=%s repair_mode=%s",
                      critic_result["verdict"], critic_result.get("severity"), repair_mode)
 
+        critic_ms = (
+            round((time.perf_counter() - critic_started) * 1000, 1)
+            if critic_ran else 0.0
+        )
         critic_details = (
-            dict(self.critic.last_details) if self.cfg.critic_enabled else {}
+            dict(self.critic.last_details) if critic_ran else {}
         )
         if self.cfg.critic_enabled and self.cfg.critic_polish_enabled:
             answer = self._sanitize_answer(self.critic.polish(answer))
@@ -988,6 +1107,7 @@ class ProductionRAGPipeline:
             "severity": critic_result.get("severity", "none"),
             "repair_mode": repair_mode,
             "repair_attempts": repair_attempts,
+            "critic_ran": critic_ran,
             "validated": validated,
             "rag_triad": triad.as_dict(),
         }
@@ -1055,6 +1175,9 @@ class ProductionRAGPipeline:
                 "answerable": answerable,
                 "low_confidence": low_confidence,
                 "web_scrape_used": web_scrape_used,
+                "adaptive_web": dict(self._last_adaptive_web_usage),
+                "critic_ran": critic_ran,
+                "critic_ms": critic_ms,
                 "pdf_answerable": pdf_answerable,
                 "web_candidates": len(web_candidates),
                 "web_evidence_relevant": web_evidence_relevant,
@@ -1218,13 +1341,34 @@ class ProductionRAGPipeline:
             "rerank_score": round(chunk.get("rerank_score", 0.0), 3),
         }
 
-    def _web_scrape_chunks(self, query: str) -> list[dict]:
+    def _web_scrape_chunks(self, query: str, max_urls: Optional[int] = None,
+                           exclude_urls: Optional[set[str]] = None) -> list[dict]:
+        """Search/fetch a bounded number of sources and batch their embeddings."""
         assert self.web_store is not None, "Call await setup() before query()."
+        requested_urls = max(
+            1,
+            min(
+                int(max_urls or self.cfg.max_scrape_urls),
+                int(self.cfg.max_scrape_urls),
+            ),
+        )
+        excluded = {
+            normalized
+            for normalized in (
+                _normalize_url(url) for url in (exclude_urls or set()) if url
+            )
+            if normalized
+        }
+
         raw = []
         for attempt in range(self.cfg.ddg_retries):
             try:
+                search_size = max(
+                    self.cfg.max_scrape_urls * 2,
+                    (requested_urls + len(excluded)) * 3,
+                )
                 with DDGS() as ddgs:
-                    raw = list(ddgs.text(query, max_results=self.cfg.max_scrape_urls * 2))
+                    raw = list(ddgs.text(query, max_results=search_size))
                 if raw:
                     break
                 time.sleep(2 ** attempt)
@@ -1234,130 +1378,109 @@ class ProductionRAGPipeline:
 
         approved = _select_web_results(
             raw,
-            self.cfg.max_scrape_urls,
+            max(self.cfg.max_scrape_urls, requested_urls + len(excluded)),
             self.cfg.min_domain_score,
         )
-        # new_chunks = 0
-        # for result in approved:
-        #     original_url = result["href"]
-        #     if not _host_is_public(urlsplit(original_url).hostname or ""):
-        #         log.warning("[WebScrape] Rejected non-public URL: %s", original_url)
-        #         continue
-        #     fetched = self._fetch_verified_url(original_url)
-        #     if not fetched:
-        #         continue
-        #     canonical_url, title, text = fetched
-        #     if self.web_store.is_fresh(canonical_url):
-        #         continue
-        #     new_chunks += self.web_store.upsert(canonical_url, title or result.get("title", "Web"), text)
-        
-        # log.info("[WebScrape] %d new chunks added to persistent store", new_chunks)
-        # return self.web_store.search(query, k=self.cfg.web_top_k)
 
-        # Evaluate and deduplicate URLs before making any HTTP requests.
         candidates = []
         seen_urls = set()
         rejected_urls = 0
-
         for result in approved:
             original_url = result.get("href", "")
-
             if self.cfg.url_evaluator_enabled:
                 decision = evaluate_url(
                     original_url,
                     min_domain_score=self.cfg.min_domain_score,
                 )
-
                 if not decision["allowed"]:
                     rejected_urls += 1
-                    log.info(
-                        "[WebScrape] URL rejected before fetch: %s | reason=%s",
-                        original_url,
-                        decision["reason"],
-                    )
                     continue
-
                 normalized_url = decision["normalized_url"]
             else:
                 normalized_url = _normalize_url(original_url)
 
-            if not normalized_url or normalized_url in seen_urls:
+            if (
+                not normalized_url
+                or normalized_url in excluded
+                or normalized_url in seen_urls
+            ):
                 continue
-
             seen_urls.add(normalized_url)
-
             result_copy = dict(result)
             result_copy["href"] = normalized_url
             candidates.append(result_copy)
+            if len(candidates) >= requested_urls:
+                break
 
         log.info(
-            "[WebScrape] URL evaluation: %d approved, %d rejected, %d unique",
-            len(candidates),
-            rejected_urls,
-            len(seen_urls),
+            "[WebScrape] requested=%d approved=%d rejected=%d excluded=%d",
+            requested_urls, len(candidates), rejected_urls, len(excluded),
         )
 
-        # Fetch approved URLs concurrently.
-        fetch_workers = max(1, int(self.cfg.web_fetch_workers))
         fetched_results = []
-
+        fetch_workers = max(
+            1, min(len(candidates) or 1, int(self.cfg.web_fetch_workers))
+        )
         with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
             futures = {
-                pool.submit(self._fetch_verified_url, result["href"], query,
-                            result.get("domain_score", 0)): result
+                pool.submit(
+                    self._fetch_verified_url,
+                    result["href"],
+                    query,
+                    result.get("domain_score", 0),
+                ): result
                 for result in candidates
             }
-
-            for future in futures:
-                result = futures[future]
+            for future, result in futures.items():
                 try:
                     fetched = future.result()
                 except Exception as exc:
-                    log.warning(
-                        "[WebScrape] Fetch failed for %s: %s",
-                        result["href"],
-                        exc,
-                    )
+                    log.warning("[WebScrape] Fetch failed for %s: %s", result["href"], exc)
                     continue
-
                 if fetched:
                     fetched_results.append((result, fetched))
 
-        # Persist sequentially unless WebChunkStore is explicitly thread-safe.
-        new_chunks = 0
+        pending_pages = []
         seen_content = set()
-
+        fetched_urls = []
         for result, fetched in fetched_results:
             canonical_url, title, text, page_metadata = fetched
-
-            content_hash = hashlib.sha256(re.sub(r"\s+", " ", text.lower()).encode()).hexdigest()
+            content_hash = hashlib.sha256(
+                re.sub(r"\s+", " ", text.lower()).encode()
+            ).hexdigest()
             if content_hash in seen_content:
-                log.info("[WebScrape] Skipping duplicate page content: %s", canonical_url)
                 continue
             seen_content.add(content_hash)
-
+            fetched_urls.append(canonical_url)
             if self.web_store.is_fresh(canonical_url):
                 continue
-
-            new_chunks += self.web_store.upsert(
+            pending_pages.append((
                 canonical_url,
                 title or result.get("title", "Web"),
                 text,
-                metadata={
+                {
                     "domain_score": result.get("domain_score"),
                     "domain_score_reasons": result.get("domain_score_reasons", []),
                     **page_metadata,
                 },
-            )
+            ))
 
+        # One batched embedding/upsert replaces one embedding call per source.
+        new_chunks = self.web_store.upsert_batch(pending_pages) if pending_pages else 0
+        self._last_web_scrape_stats = {
+            "query": query,
+            "requested_urls": requested_urls,
+            "fetched_urls": fetched_urls,
+            "new_chunks": new_chunks,
+        }
         log.info(
-            "[WebScrape] Fetched %d/%d approved URLs; %d new chunks added",
-            len(fetched_results),
-            len(candidates),
-            new_chunks,
+            "[WebScrape] fetched=%d/%d new_chunks=%d",
+            len(fetched_urls), len(candidates), new_chunks,
         )
-
-        return self.web_store.search(query, k=self.cfg.web_top_k)
+        return self.web_store.search(
+            query,
+            k=min(self.cfg.web_top_k, max(2, requested_urls * 3)),
+        )
 
     def _fetch_verified_url(self, url: str, query: str = "", domain_score: float = 0.0,
                             char_limit: int = 2500):
@@ -1395,7 +1518,7 @@ class ProductionRAGPipeline:
                     resp = session.get(
                         current_url,
                         headers={"User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)"},
-                        timeout=10,
+                        timeout=self.cfg.web_request_timeout_seconds,
                         allow_redirects=False,
                     )
                     if 300 <= resp.status_code < 400:

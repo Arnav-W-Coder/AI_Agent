@@ -168,6 +168,17 @@ class TestDatabase:
         assert cfg.vlm_temperature == 0.0
 
     @pytest.mark.layer1
+    def test_latency_oriented_defaults_are_bounded(self, cfg: RAGConfig):
+        assert cfg.rewrite_only_when_ambiguous is True
+        assert cfg.top_k_dense <= 20
+        assert cfg.top_k_sparse <= 20
+        assert cfg.top_k_rerank <= 8
+        assert cfg.adaptive_web_initial_sources <= 2
+        assert cfg.adaptive_web_sources_per_round <= 2
+        assert cfg.adaptive_web_max_rounds <= 2
+        assert cfg.context_budget_tokens <= 5000
+
+    @pytest.mark.layer1
     def test_markdown_table_detection(self):
         assert markdown_has_table("| Name | Value |\n| --- | --- |\n| A | 1 |")
         assert not markdown_has_table("A paragraph with no tabular structure.")
@@ -810,6 +821,26 @@ class TestQueryRewriteControls:
         assert isinstance(QueryRewriter._looks_ambiguous(query), bool)
         assert isinstance(QueryRewriter._needs_expansion(query), bool)
 
+    @pytest.mark.layer1
+    def test_clear_explanation_skips_rewrite_llm(self, cfg, db):
+        from rewriter import QueryRewriter
+
+        class MustNotRun:
+            def invoke(self, *_args, **_kwargs):
+                raise AssertionError("rewrite LLM should not run for a clear explanation")
+
+        rewriter = QueryRewriter.__new__(QueryRewriter)
+        rewriter.db = db
+        rewriter.cfg = cfg
+        rewriter._standalone_chain = MustNotRun()
+        rewriter._expansion_chain = MustNotRun()
+
+        rewrite_id, queries = rewriter.rewrite_queries(
+            "Why are liquids considered incompressible fluids?"
+        )
+        assert rewrite_id == 0
+        assert queries == ["Why are liquids considered incompressible fluids?"]
+
 
 class TestIngestion:
     """ingestion.py — file identity, parent storage, and embedding persistence."""
@@ -928,6 +959,99 @@ class TestCriticUncertaintyDetection:
     @pytest.mark.layer1
     def test_compute_faithfulness_five_claims_floors_at_zero(self):
         assert _compute_faithfulness("HALLUCINATED", "• a\n• b\n• c\n• d\n• e\n• f") == 0.0
+
+
+class TestAdaptiveLatencyControls:
+    """Fast-path critic policy and bounded adaptive web loop."""
+
+    @pytest.mark.layer1
+    def test_high_confidence_answer_skips_critic(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.critic_enabled = True
+        cfg.critic_on_low_confidence_only = True
+        assert instance._should_run_critic(
+            low_confidence=False, answerable=True
+        ) is False
+        assert instance._should_run_critic(
+            low_confidence=True, answerable=True
+        ) is True
+
+    @pytest.mark.layer1
+    def test_adaptive_web_stops_after_first_sufficient_round(self, cfg):
+        from pipeline import ProductionRAGPipeline
+
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.adaptive_web_enabled = True
+        cfg.adaptive_web_initial_sources = 2
+        cfg.adaptive_web_sources_per_round = 2
+        cfg.adaptive_web_max_rounds = 2
+        cfg.max_scrape_urls = 6
+
+        calls = []
+        def fake_scrape(query, max_urls=None, exclude_urls=None):
+            calls.append((query, max_urls))
+            instance._last_web_scrape_stats = {
+                "fetched_urls": ["https://a.example", "https://b.example"]
+            }
+            return [
+                {
+                    "source_type": "web", "source_url": "https://a.example",
+                    "text": "liquids incompressible pressure volume",
+                    "rerank_score": 5.0,
+                },
+                {
+                    "source_type": "web", "source_url": "https://b.example",
+                    "text": "liquid volume changes very little under pressure",
+                    "rerank_score": 4.0,
+                },
+            ]
+        instance._web_scrape_chunks = fake_scrape
+        instance._combined_evidence_is_answerable = lambda _q, chunks: len(chunks) >= 2
+
+        class FakeReranker:
+            def rerank_against_original(self, _q, candidates, _k, _min):
+                return candidates
+        class FakeRetriever:
+            def expand_to_context(self, chunks):
+                return chunks
+        instance.reranker = FakeReranker()
+        instance.retriever = FakeRetriever()
+
+        result = instance._broader_web_retrieval(
+            "Why are liquids incompressible?",
+            ["Why are liquids incompressible?"],
+            [],
+            "explanation",
+            6,
+        )
+        assert len(calls) == 1
+        assert calls[0][1] == 2
+        assert len(result) == 2
+        assert instance._last_adaptive_web_usage["stop_reason"] == "answerable"
+
+    @pytest.mark.layer1
+    def test_simple_source_selection_caps_duplicate_source_chunks(self):
+        from pipeline import ProductionRAGPipeline
+        chunks = [
+            {
+                "source_type": "web", "source_url": "https://same.example",
+                "text": f"chunk {i}", "rerank_score": 10.0 - i,
+            }
+            for i in range(5)
+        ] + [{
+            "source_type": "web", "source_url": "https://other.example",
+            "text": "independent", "rerank_score": 4.0,
+        }]
+        selected = ProductionRAGPipeline._diversify_sources(
+            chunks, "explanation", limit=6, max_per_source=2
+        )
+        same_count = sum(
+            item.get("source_url") == "https://same.example" for item in selected
+        )
+        assert same_count == 2
 
 
 class TestRAGTriadDiagnostics:

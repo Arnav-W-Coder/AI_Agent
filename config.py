@@ -48,9 +48,11 @@ class RAGConfig:
     vlm_generation_enabled: bool = True
 
     # Retrieval
-    top_k_dense: int = 40
-    top_k_sparse: int = 40
-    top_k_rerank: int = 25
+    # Keep the initial candidate pool broad enough for recall, but avoid
+    # expensive 40+40 candidate fan-out on every simple question.
+    top_k_dense: int = 20
+    top_k_sparse: int = 20
+    top_k_rerank: int = 8
     rrf_k: int = 60
     min_rerank_score: float = -8.0
     min_mean_rerank_score: float = 0.0
@@ -84,16 +86,22 @@ class RAGConfig:
     checkpoint_sample_items: int = 3
 
     # Web scraping
-    max_scrape_urls: int = 5
-    ddg_retries: int = 3
+    # max_scrape_urls is a hard per-query ceiling. Adaptive web retrieval starts
+    # smaller and only spends more network requests when evidence is still weak.
+    max_scrape_urls: int = 6
+    ddg_retries: int = 2
     min_domain_score: int = 55
-    web_top_k: int = 10
+    web_top_k: int = 6
     always_scrape_web: bool = False
+    adaptive_web_enabled: bool = True
+    adaptive_web_initial_sources: int = 2
+    adaptive_web_sources_per_round: int = 2
+    adaptive_web_max_rounds: int = 2
     web_chroma_dir: Path = field(default_factory=lambda: Path("./chroma_web"))
     web_chunk_ttl_hours: int = 24
     web_collection_max_chunks: int = 8000
     web_fetch_workers: int = 4
-    web_request_timeout_seconds: int = 12
+    web_request_timeout_seconds: int = 8
     web_min_text_chars: int = 400
     web_min_page_quality: float = 0.45
     web_min_query_relevance: float = 0.20
@@ -129,8 +137,10 @@ class RAGConfig:
 
     # Rewriter
     rewrite_enabled: bool = True
-    multi_query_max_queries: int = 5
-    rewrite_only_when_ambiguous: bool = False
+    multi_query_max_queries: int = 4
+    # Clear standalone explanation/definition queries skip the rewrite LLM.
+    # Ambiguous, comparison and multi-constraint queries still expand.
+    rewrite_only_when_ambiguous: bool = True
     rewriter_helpful_min_score: float = 0.80
     rewriter_unhelpful_max_score: float = 0.40
 
@@ -145,8 +155,8 @@ class RAGConfig:
     parent_max_tokens: int = 900
     child_max_tokens: int = 220
     child_overlap_tokens: int = 40
-    context_neighbor_count: int = 2
-    context_budget_tokens: int = 9000
+    context_neighbor_count: int = 1
+    context_budget_tokens: int = 5000
 
     # Query routing / confidence
     query_routing_enabled: bool = True
