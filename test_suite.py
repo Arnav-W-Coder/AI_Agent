@@ -1108,6 +1108,11 @@ class TestAdaptiveLatencyControls:
         assert instance._should_run_critic(
             low_confidence=True, answerable=True
         ) is True
+        assert instance._should_run_critic(
+            low_confidence=False,
+            answerable=True,
+            generation_request=True,
+        ) is True
 
     @pytest.mark.layer1
     def test_adaptive_web_uses_persistent_cache_before_network(self, cfg):
@@ -1238,6 +1243,21 @@ class TestAdaptiveLatencyControls:
 
 class TestRAGTriadDiagnostics:
     """Diagram-aligned routing: answer relevance, context relevance, faithfulness."""
+
+    @pytest.mark.layer1
+    def test_skipped_critic_is_not_reported_as_fully_validated(self, cfg):
+        result = assess_rag_triad(
+            critic_details={},
+            critic_verdict="PASS",
+            answerable=True,
+            abstained=False,
+            cfg=cfg,
+            critic_evaluated=False,
+        )
+        assert result.answer_relevance is None
+        assert result.context_relevance == 1.0
+        assert result.faithfulness is None
+        assert result.passed is None
 
     @pytest.mark.layer1
     def test_all_three_checks_pass(self, cfg):
