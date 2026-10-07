@@ -1396,6 +1396,23 @@ class TestOriginalQuestionReranking:
         assert [item["filename"] for item in ordered] == ["a.pdf", "b.pdf", "context.pdf"]
 
     @pytest.mark.layer1
+    def test_practice_problem_request_is_generation_and_extracts_subject(self):
+        from pipeline import ProductionRAGPipeline
+
+        query = "give me practice problems for fluids physics 2c"
+        assert ProductionRAGPipeline._is_generation_request(query) is True
+        assert ProductionRAGPipeline._generation_retrieval_query(query) == "fluids physics 2c"
+        assert ProductionRAGPipeline._classify_query(query) == "practice"
+
+    @pytest.mark.layer1
+    def test_give_information_is_not_artifact_generation(self):
+        from pipeline import ProductionRAGPipeline
+
+        assert ProductionRAGPipeline._is_generation_request(
+            "give me information about fluids"
+        ) is False
+
+    @pytest.mark.layer1
     def test_generation_request_builds_evidence_query(self):
         from pipeline import ProductionRAGPipeline
 
@@ -1408,6 +1425,9 @@ class TestOriginalQuestionReranking:
         assert ProductionRAGPipeline._generation_retrieval_query(
             "Implement a hybrid RAG retriever"
         ) == "a hybrid RAG retriever"
+        assert ProductionRAGPipeline._generation_retrieval_query(
+            "give me a quiz on electrostatics"
+        ) == "electrostatics"
 
     @pytest.mark.layer1
     def test_answerability_rejects_keyword_mismatch(self, cfg):

@@ -171,6 +171,12 @@ class ProductionRAGPipeline:
             and any(marker in text for marker in ("why ", "how ", "isn't", "isnt", "aren't", "arent"))
         ):
             return "comparison"
+        if any(phrase in text for phrase in (
+            "practice problem", "practice problems", "practice question",
+            "practice questions", "quiz", "worksheet", "flashcard",
+            "flashcards", "study guide", "review questions", "exercises",
+        )):
+            return "practice"
         if any(word in words for word in ("best", "recommend", "recommendation", "alternatives")):
             return "recommendation"
         if any(marker in text for marker in ("survey", "state of the art", "literature", "research",
@@ -198,24 +204,53 @@ class ProductionRAGPipeline:
             "design", "develop", "prepare", "solve",
         }
         words = re.findall(r"[a-z0-9]+", question.lower())
-        return any(word in generation_verbs for word in words[:6])
+        if any(word in generation_verbs for word in words[:6]):
+            return True
+
+        # "Give/make me ..." is only generation when it targets an artifact.
+        # This avoids treating ordinary requests such as "give me information"
+        # as artifact-generation queries.
+        text = question.lower()
+        artifact_markers = (
+            "practice problem", "practice problems", "practice question",
+            "practice questions", "quiz", "worksheet", "flashcard",
+            "flashcards", "study guide", "review questions", "exercises",
+        )
+        soft_generation_verbs = {"give", "make"}
+        return (
+            any(word in soft_generation_verbs for word in words[:4])
+            and any(marker in text for marker in artifact_markers)
+        )
 
     @staticmethod
     def _generation_retrieval_query(question: str) -> str:
         """Remove artifact instructions while preserving the evidence subject."""
         query = re.sub(r"^\s*(?:please\s+)?", "", question.strip(), flags=re.IGNORECASE)
+        # Study/practice requests need retrieval over the subject, not over the
+        # artifact words themselves ("give", "practice", "problems", etc.).
         query = re.sub(
-            r"^(?:write|draft|create|generate|implement|build|research|summarize|"
-            r"translate|rewrite|refactor|design|develop|prepare|solve)\s+",
+            r"^(?:give|make|create|generate|write|prepare)\s+(?:me\s+)?"
+            r"(?:(?:some|a|an|the)\s+)?"
+            r"(?:practice\s+(?:problems?|questions?)|quiz(?:zes)?|worksheet|"
+            r"flashcards?|exercises?|study\s+guide|review\s+questions?)\s+"
+            r"(?:for|about|on|of)\s+",
             "",
             query,
             flags=re.IGNORECASE,
         )
         query = re.sub(
-            r"^(?:a|an|the)\s+(?:potential\s+)?"
+            r"^(?:write|draft|create|generate|implement|build|research|summarize|"
+            r"translate|rewrite|refactor|design|develop|prepare|solve|make|give)\s+",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(
+            r"^(?:me\s+)?(?:a|an|the)?\s*(?:potential\s+)?"
             r"(?:introductory paragraph|introduction|essay|email|story|report|"
-            r"implementation|study plan|architecture|summary|translation|"
-            r"refactor|design|solution|piece of code)\s+"
+            r"implementation|study plan|study guide|practice problems?|"
+            r"practice questions?|quiz(?:zes)?|worksheet|flashcards?|exercises?|"
+            r"architecture|summary|translation|refactor|design|solution|piece of code)\s+"
             r"(?:for|about|on|of)\s+",
             "",
             query,
@@ -299,6 +334,11 @@ class ProductionRAGPipeline:
                 self.cfg.top_k_rerank + 4,
                 min(self.cfg.top_k_rerank * 2, 12),
             )
+        elif query_type == "practice":
+            plan["queries"] = [question]
+            plan["top_k"] = min(self.cfg.top_k_rerank, 6)
+            plan["candidate_k"] = min(max(plan["top_k"] + 4, plan["top_k"]), 10)
+            plan["diversify"] = True
         elif query_type == "recommendation":
             if self.cfg.recommendation_query_expansion_enabled:
                 plan["queries"] = self._recommendation_queries(question, plan["queries"])
@@ -961,6 +1001,10 @@ class ProductionRAGPipeline:
             self._generation_retrieval_query(question)
             if generation_request else question
         )
+        # All retrieval sufficiency checks must evaluate the evidence subject,
+        # not the user's artifact instruction. Final generation still receives
+        # the original question so the requested output format is preserved.
+        answerability_query = evidence_query if generation_request else question
         trace.query_text = question
         trace.t_rewrite = time.time()
         log.info("\n[Query] '%s'", question[:80])
@@ -969,14 +1013,14 @@ class ProductionRAGPipeline:
         retrieval_plan = self._route_query(question, query_type, rewritten_queries)
         if generation_request:
             retrieval_plan["queries"] = list(dict.fromkeys([
-                *retrieval_plan["queries"],
                 evidence_query,
-                f"{evidence_query} evidence examples documentation",
+                f"{evidence_query} concepts formulas examples",
             ]))
             retrieval_plan["diversify"] = True
+            retrieval_plan["top_k"] = min(retrieval_plan["top_k"], 6)
             retrieval_plan["candidate_k"] = max(
                 retrieval_plan["candidate_k"],
-                self.cfg.top_k_rerank * 2,
+                min(self.cfg.top_k_rerank + 4, 10),
             )
         retrieval_queries = retrieval_plan["queries"]
         rerank_query = evidence_query if generation_request else question
@@ -1119,8 +1163,8 @@ class ProductionRAGPipeline:
 
             pdf_evidence = [chunk for chunk in combined_chunks if chunk.get("source_type") != "web"]
             web_evidence = [chunk for chunk in combined_chunks if chunk.get("source_type") == "web"]
-            pdf_answerable = self._combined_evidence_is_answerable(question, pdf_evidence)
-            combined_answerable = self._combined_evidence_is_answerable(question, combined_chunks)
+            pdf_answerable = self._combined_evidence_is_answerable(answerability_query, pdf_evidence)
+            combined_answerable = self._combined_evidence_is_answerable(answerability_query, combined_chunks)
             need_adaptive_web = (
                 use_web_fallback
                 and (retrieval_plan["always_web"] or not combined_answerable)
@@ -1133,7 +1177,7 @@ class ProductionRAGPipeline:
                     else "Local sources failed answerability",
                 )
                 chunks = self._broader_web_retrieval(
-                    question,
+                    answerability_query,
                     retrieval_queries,
                     chunks,
                     query_type,
@@ -1148,7 +1192,7 @@ class ProductionRAGPipeline:
 
             safe_chunks = [{k: v for k, v in c.items()
                             if isinstance(v, (str, int, float, bool, type(None), list))} for c in chunks]
-            if self._combined_evidence_is_answerable(question, chunks):
+            if self._combined_evidence_is_answerable(answerability_query, chunks):
                 self.cache.set_retrieval(retrieval_cache_key, safe_chunks)
             else:
                 log.info("[Cache] Skipping weak retrieval result")
@@ -1161,9 +1205,9 @@ class ProductionRAGPipeline:
 
         pdf_candidates = [chunk for chunk in chunks if chunk.get("source_type") != "web"]
         web_candidates = [chunk for chunk in chunks if chunk.get("source_type") == "web"]
-        pdf_answerable = self._combined_evidence_is_answerable(question, pdf_candidates)
-        answerable = self._combined_evidence_is_answerable(question, chunks)
-        web_evidence_relevant = self._web_evidence_is_relevant(question, web_candidates)
+        pdf_answerable = self._combined_evidence_is_answerable(answerability_query, pdf_candidates)
+        answerable = self._combined_evidence_is_answerable(answerability_query, chunks)
+        web_evidence_relevant = self._web_evidence_is_relevant(answerability_query, web_candidates)
         low_confidence = (
             trace.top_rerank_score < self.cfg.answerability_min_top_score
             or trace.mean_rerank_score < self.cfg.answerability_min_mean_score
@@ -1180,7 +1224,7 @@ class ProductionRAGPipeline:
                      "Low confidence requires web evidence" if require_web
                      else "Answerability gate failed")
             chunks = self._broader_web_retrieval(
-                question,
+                answerability_query,
                 retrieval_queries,
                 chunks,
                 query_type,
@@ -1191,8 +1235,8 @@ class ProductionRAGPipeline:
             scores = [c.get("rerank_score", 0.0) for c in chunks if "rerank_score" in c]
             pdf_candidates = [chunk for chunk in chunks if chunk.get("source_type") != "web"]
             web_candidates = [chunk for chunk in chunks if chunk.get("source_type") == "web"]
-            answerable = self._combined_evidence_is_answerable(question, chunks)
-            web_evidence_relevant = self._web_evidence_is_relevant(question, web_candidates)
+            answerable = self._combined_evidence_is_answerable(answerability_query, chunks)
+            web_evidence_relevant = self._web_evidence_is_relevant(answerability_query, web_candidates)
             trace.num_chunks_retrieved = len(chunks)
             trace.mean_rerank_score = round(sum(scores) / len(scores), 4) if scores else 0.0
             trace.top_rerank_score = max(scores) if scores else 0.0
@@ -1202,7 +1246,7 @@ class ProductionRAGPipeline:
             )
 
         log.info(self._retrieval_debug_summary(
-            question,
+            answerability_query,
             retrieval_queries,
             retrieval_calls,
             unique_candidate_count,
@@ -1228,7 +1272,7 @@ class ProductionRAGPipeline:
         else:
             log.info(
                 "[Answerability] FAILED: %s",
-                self._answerability_debug(chunks, question),
+                self._answerability_debug(chunks, answerability_query),
             )
             log.warning("[Query] Answerability gate failed; returning insufficient-information response")
             answer = self._insufficient_information_response(question)
@@ -1393,8 +1437,12 @@ class ProductionRAGPipeline:
                 "chunks_used": len(chunks), "bm25_overlap": trace.bm25_overlap,
                 "retrieval_cached": trace.retrieval_cache_hit,
                 "query_type": query_type,
+                "generation_request": generation_request,
+                "evidence_query": evidence_query,
                 "answerable": answerable,
-                "answerability_debug": self._answerability_debug(chunks, question),
+                "answerability_debug": self._answerability_debug(
+                    chunks, answerability_query
+                ),
                 "low_confidence": low_confidence,
                 "web_scrape_used": web_scrape_used,
                 "adaptive_web": dict(self._last_adaptive_web_usage),
