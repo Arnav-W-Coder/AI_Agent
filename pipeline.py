@@ -35,6 +35,32 @@ from url_evaluator import evaluate_url
 
 log = logging.getLogger(__name__)
 
+_PRACTICE_PROMPT = ChatPromptTemplate.from_template("""
+You are creating source-grounded practice material.
+
+Use only concepts, formulas, relationships, and terminology supported by the
+retrieved CONTEXT. Hypothetical numerical values are allowed, but every problem
+must be internally consistent and solvable from the information given plus
+relationships explicitly supported by the context.
+
+Requirements:
+- Create at most {max_problems} concise practice problems.
+- Include all quantities or conditions required to solve each problem.
+- Do not invent named problem sets, textbook labels, experimental facts, or
+  physical laws that are absent from the context.
+- Do not ask for a quantity that requires missing information.
+- Avoid contradictions between the stated physical model and requested result.
+- Prefer a mix of conceptual and quantitative questions when supported.
+- Do not include solutions unless the user asks for them.
+- Output the practice material only.
+
+CONTEXT:
+{context}
+
+USER REQUEST:
+{question}
+""")
+
 _RAG_PROMPT = ChatPromptTemplate.from_template("""
 You are a precise research assistant. Answer the QUESTION using only the
 retrieved CONTEXT. Synthesize relevant evidence across sources.
@@ -652,10 +678,16 @@ class ProductionRAGPipeline:
     def _insufficient_information_response(question: str) -> str:
         return CANONICAL_INSUFFICIENT_INFO_RESPONSE
 
-    def _should_run_critic(self, *, low_confidence: bool, answerable: bool) -> bool:
-        """Respect the configured critic fast path for high-confidence answers."""
+    def _should_run_critic(self, *, low_confidence: bool, answerable: bool,
+                           generation_request: bool = False) -> bool:
+        """Respect the fast path while always validating generated artifacts."""
         if not self.cfg.critic_enabled:
             return False
+        if (
+            generation_request
+            and getattr(self.cfg, "critic_on_generation_requests", True)
+        ):
+            return True
         if not self.cfg.critic_on_low_confidence_only:
             return True
         return bool(low_confidence or not answerable)
@@ -954,6 +986,7 @@ class ProductionRAGPipeline:
         self.retriever: Optional[HybridRetriever] = None
         self.web_store: Optional[WebChunkStore] = None
         self._rag_chain = _RAG_PROMPT | self.llm | StrOutputParser()
+        self._practice_chain = _PRACTICE_PROMPT | self.llm | StrOutputParser()
         self._query_count = 0
         self._last_multimodal_usage = {
             "generation_mode": "not_run", "images_attached": 0, "tables_attached": 0,
@@ -1298,7 +1331,9 @@ class ProductionRAGPipeline:
         }
         if answerable:
             log.info("[Query] Generating answer over %d chunks...", len(chunks))
-            raw_answer = self._generate_multimodal(question, context, chunks).strip()
+            raw_answer = self._generate_multimodal(
+                question, context, chunks, query_type=query_type
+            ).strip()
             answer = self._sanitize_answer(raw_answer)
         else:
             log.info(
@@ -1318,6 +1353,7 @@ class ProductionRAGPipeline:
         should_run_critic = self._should_run_critic(
             low_confidence=low_confidence,
             answerable=answerable,
+            generation_request=generation_request,
         )
         repair_mode = (
             "critic_disabled"
@@ -1378,6 +1414,7 @@ class ProductionRAGPipeline:
             answerable=answerable,
             abstained=abstained,
             cfg=self.cfg,
+            critic_evaluated=critic_ran,
         )
         faith_score = triad.faithfulness
         trace.answer_relevance = triad.answer_relevance
@@ -1385,16 +1422,16 @@ class ProductionRAGPipeline:
         trace.answer_faithfulness = faith_score
         trace.triad_pass = triad.passed
         trace.triage_action = ";".join(triad.triage_actions)
-        if not triad.passed:
+        if triad.passed is False:
             log.warning(
                 "[RAG Triad] low=%s actions=%s",
                 list(triad.low_metrics), list(triad.triage_actions),
             )
 
         validated = (
-            self.cfg.critic_enabled
+            critic_ran
             and critic_result["verdict"] == "PASS"
-            and triad.passed
+            and triad.passed is True
         )
         critic_metadata = {
             "initial_answer": generated_answer,
@@ -1430,14 +1467,21 @@ class ProductionRAGPipeline:
         self.metrics.record(trace)
         if conversation_id:
             self.memory.add_message(conversation_id, "assistant", answer)
-        triad_score = min(
-            triad.answer_relevance, triad.context_relevance, triad.faithfulness
-        )
-        self.rewriter.record_answer_score(rewrite_id, triad_score)
-        if triad_score >= self.cfg.rewriter_helpful_min_score:
-            self.rewriter.record_feedback(rewrite_id, helpful=True)
-        elif triad_score < self.cfg.rewriter_unhelpful_max_score:
-            self.rewriter.record_feedback(rewrite_id, helpful=False)
+        triad_values = [
+            value for value in (
+                triad.answer_relevance,
+                triad.context_relevance,
+                triad.faithfulness,
+            )
+            if value is not None
+        ]
+        triad_score = min(triad_values) if triad_values else None
+        if triad_score is not None:
+            self.rewriter.record_answer_score(rewrite_id, triad_score)
+            if triad_score >= self.cfg.rewriter_helpful_min_score:
+                self.rewriter.record_feedback(rewrite_id, helpful=True)
+            elif triad_score < self.cfg.rewriter_unhelpful_max_score:
+                self.rewriter.record_feedback(rewrite_id, helpful=False)
 
         self._query_count += 1
         drift_alert = self.metrics.check_drift() if self._query_count % self.cfg.drift_window == 0 else None
@@ -1524,12 +1568,24 @@ class ProductionRAGPipeline:
         return selected
 
     def _generate_multimodal(self, question: str, context: str,
-                             chunks: list[dict]) -> str:
+                             chunks: list[dict], query_type: str = "") -> str:
         image_chunks = self._select_image_chunks(chunks)
         if not image_chunks or self.vision_llm is None:
             self._last_multimodal_usage = {
                 "generation_mode": "text_only", "images_attached": 0, "tables_attached": 0,
             }
+            if query_type == "practice":
+                return self._practice_chain.invoke({
+                    "context": context,
+                    "question": question,
+                    "max_problems": self.cfg.practice_max_problems,
+                })
+            if query_type == "practice":
+                return self._practice_chain.invoke({
+                    "context": context,
+                    "question": question,
+                    "max_problems": self.cfg.practice_max_problems,
+                })
             return self._rag_chain.invoke({"context": context, "question": question})
         self._last_multimodal_usage = {
             "generation_mode": "vision", "images_attached": len(image_chunks),
