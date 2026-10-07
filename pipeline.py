@@ -27,8 +27,8 @@ from critic import CANONICAL_INSUFFICIENT_INFO_RESPONSE, CriticAndRepair
 from db import Database
 from ingestion import AsyncIngestionPipeline
 from memory import ConversationMemory
-from metrics import MetricsRecorder, QueryTrace
-from retrieval import BM25Index, CrossEncoderReranker, HybridRetriever
+from metrics import MetricsRecorder, QueryTrace, assess_rag_triad
+from retrieval import BM25Index, CrossEncoderReranker, HybridRetriever, stable_chunk_sort_key
 from rewriter import QueryRewriter
 from web_store import WebChunkStore
 from url_evaluator import evaluate_url
@@ -300,11 +300,7 @@ class ProductionRAGPipeline:
         if query_type not in {"comparison", "recommendation", "research", "multi_constraint"}:
             return chunks[:limit]
 
-        remaining = sorted(
-            chunks,
-            key=lambda chunk: chunk.get("rerank_score", 0.0),
-            reverse=True,
-        )
+        remaining = sorted(chunks, key=stable_chunk_sort_key)
         selected = []
         source_counts: dict[str, int] = {}
         domain_counts: dict[str, int] = {}
@@ -499,10 +495,9 @@ class ProductionRAGPipeline:
 
         PASS         -> accept the answer as-is.
         UNCERTAIN    -> preserve the answer; the critic couldn't evaluate it.
-        HALLUCINATED, severity "minor" (groundedness PASSed; only
-            completeness/relevance were flagged) -> treat as INCOMPLETE and
-            preserve the original rather than rewrite a claim that was
-            already grounded.
+        HALLUCINATED, severity "minor" (groundedness PASSed) -> repair
+            answer-relevance/completeness problems when possible; preserve
+            context-relevance-only failures so retrieval can be triaged instead.
         HALLUCINATED, severity "major" (groundedness FAILed) -> perform a
             substantive repair.
         A repair that fails to produce a usable answer -> preserve the
@@ -517,7 +512,14 @@ class ProductionRAGPipeline:
             return answer, "uncertain"
         severity = critic_result.get("severity", "major")
         if verdict == "HALLUCINATED" and severity == "minor":
-            return answer, "incomplete_preserved"
+            details = getattr(self.critic, "last_details", {})
+            repairable_focus_issue = (
+                details.get("answer_relevance") == "FAIL"
+                or details.get("completeness") == "FAIL"
+            )
+            if not repairable_focus_issue:
+                # Low context relevance is a retrieval problem, not a wording problem.
+                return answer, "context_issue_preserved"
 
         critique = critic_result.get("critique", "")
         if self.cfg.destructive_critic_repair:
@@ -581,11 +583,7 @@ class ProductionRAGPipeline:
         pdf_winners = [chunk for chunk in reranked if chunk.get("source_type") != "web"]
         web_winners = [chunk for chunk in reranked if chunk.get("source_type") == "web"]
         expanded_pdf = self.retriever.expand_to_context(pdf_winners)
-        recovered = sorted(
-            expanded_pdf + web_winners,
-            key=lambda chunk: chunk.get("rerank_score", 0.0),
-            reverse=True,
-        )
+        recovered = sorted(expanded_pdf + web_winners, key=stable_chunk_sort_key)
         return self._diversify_sources(recovered, query_type, limit)
 
     def __init__(self, cfg: RAGConfig) -> None:
@@ -596,9 +594,24 @@ class ProductionRAGPipeline:
             max_history_messages=cfg.max_history_messages,
         )
         self.embeddings = OllamaEmbeddings(model=cfg.embed_model)
-        self.llm = ChatOllama(model=cfg.llm_model, num_ctx=cfg.ctx_window)
+        self.llm = ChatOllama(
+            model=cfg.llm_model, num_ctx=cfg.ctx_window, temperature=cfg.llm_temperature
+        )
+        self.rewriter_llm = ChatOllama(
+            model=cfg.rewriter_model or cfg.llm_model,
+            num_ctx=cfg.ctx_window,
+            temperature=cfg.rewriter_temperature,
+        )
+        self.critic_llm = ChatOllama(
+            model=cfg.critic_model or cfg.llm_model,
+            num_ctx=cfg.ctx_window,
+            temperature=cfg.critic_temperature,
+        )
         self.vision_llm = (
-            ChatOllama(model=cfg.vlm_model, num_ctx=cfg.ctx_window)
+            ChatOllama(
+                model=cfg.vlm_model, num_ctx=cfg.ctx_window,
+                temperature=cfg.vlm_temperature,
+            )
             if cfg.multimodal_enabled and cfg.vlm_generation_enabled else None
         )
         self.vectorstore = Chroma(
@@ -606,8 +619,8 @@ class ProductionRAGPipeline:
         )
         self.cache = CacheLayer(self.db, cfg)
         self.metrics = MetricsRecorder(self.db, cfg)
-        self.rewriter = QueryRewriter(self.db, cfg, self.llm)
-        self.critic = CriticAndRepair(self.llm, cfg=cfg)
+        self.rewriter = QueryRewriter(self.db, cfg, self.rewriter_llm)
+        self.critic = CriticAndRepair(self.critic_llm, cfg=cfg)
         self.bm25: Optional[BM25Index] = None
         self.reranker: Optional[CrossEncoderReranker] = None
         self.retriever: Optional[HybridRetriever] = None
@@ -694,7 +707,8 @@ class ProductionRAGPipeline:
         answer_cache_key = (
             f"question={question}\nrewritten_query={rewritten}\n"
             f"retrieval_cache_schema_version={self.cfg.retrieval_cache_schema_version}\n"
-            f"critic_config_version={self.cfg.critic_config_version}"
+            f"critic_config_version={self.cfg.critic_config_version}\n"
+            f"triad_config_version={self.cfg.triad_config_version}"
         )
         cached = self.cache.get_answer(
             question, query_emb, cache_key=answer_cache_key, include_metadata=True
@@ -775,8 +789,7 @@ class ProductionRAGPipeline:
             pdf_winners = [c for c in chunks if c.get("source_type") != "web"]
             web_winners = [c for c in chunks if c.get("source_type") == "web"]
             expanded_pdf = self.retriever.expand_to_context(pdf_winners)
-            combined_chunks = sorted(expanded_pdf + web_winners,
-                            key=lambda c: c.get("rerank_score", 0.0), reverse=True)
+            combined_chunks = sorted(expanded_pdf + web_winners, key=stable_chunk_sort_key)
             chunks = self._diversify_sources(combined_chunks, query_type, retrieval_plan["top_k"])
             trace.t_rerank = time.time()
 
@@ -861,12 +874,13 @@ class ProductionRAGPipeline:
             web_fallback_requested,
         ))
 
-        context = self._format_context(chunks)
+        evidence_context = self._format_context(chunks)
+        context = evidence_context
         if cached_answer:
             cached_context = self._format_cached_answer_context(
                 cached_answer, cached_sources
             )
-            context = f"{cached_context}\n\n[CURRENTLY RETRIEVED EVIDENCE]\n\n{context}"
+            context = f"{cached_context}\n\n[CURRENTLY RETRIEVED EVIDENCE]\n\n{evidence_context}"
         self._last_multimodal_usage = {
             "generation_mode": "not_run", "images_attached": 0, "tables_attached": 0,
         }
@@ -891,7 +905,7 @@ class ProductionRAGPipeline:
         repair_mode = "critic_disabled"
         repair_attempts = 0
         if self.cfg.critic_enabled:
-            critic_result = self.critic.evaluate(question, answer, context)
+            critic_result = self.critic.evaluate(question, answer, evidence_context)
             repair_mode = "none"
             max_attempts = max(0, int(self.cfg.critic_max_repair_attempts))
             for attempt in range(max_attempts + 1):
@@ -902,32 +916,59 @@ class ProductionRAGPipeline:
                         answer = self._insufficient_information_response(question)
                         repair_mode = "abstain"
                     break
-                repaired, repair_mode = self._repair_answer(question, answer, critic_result, context)
+                repaired, repair_mode = self._repair_answer(
+                    question, answer, critic_result, evidence_context
+                )
                 repair_attempts += 1
                 if repaired is None:
                     answer = self._insufficient_information_response(question)
                     repair_mode = "abstain"
                     break
                 answer = self._sanitize_answer(repaired)
-                if repair_mode == "incomplete_preserved":
-                    # Nothing was rewritten (groundedness already passed), so
-                    # re-running the critic on an unchanged answer would only
-                    # repeat the same verdict for the cost of another LLM call.
+                if repair_mode in {"incomplete_preserved", "context_issue_preserved"}:
+                    # Nothing was rewritten. Preserve the semantic check details
+                    # for triad diagnostics while avoiding an identical LLM call.
                     critic_result = {**critic_result, "verdict": "PASS"}
                     break
                 critic_result = (
-                    self.critic.evaluate(question, answer, context)
+                    self.critic.evaluate(question, answer, evidence_context)
                     if self.cfg.critic_require_context_grounding
                     else {"verdict": "PASS", "severity": "none", "critique": ""}
                 )
             log.info("[Query] Critic verdict=%s severity=%s repair_mode=%s",
                      critic_result["verdict"], critic_result.get("severity"), repair_mode)
 
-        critic_details = dict(self.critic.last_details)
-        faith_score = 1.0 if critic_result["verdict"] == "PASS" else 0.0
+        critic_details = (
+            dict(self.critic.last_details) if self.cfg.critic_enabled else {}
+        )
         if self.cfg.critic_enabled and self.cfg.critic_polish_enabled:
             answer = self._sanitize_answer(self.critic.polish(answer))
-        validated = self.cfg.critic_enabled and critic_result["verdict"] == "PASS"
+
+        abstained = answer.strip() == CANONICAL_INSUFFICIENT_INFO_RESPONSE
+        triad = assess_rag_triad(
+            critic_details=critic_details,
+            critic_verdict=critic_result["verdict"],
+            answerable=answerable,
+            abstained=abstained,
+            cfg=self.cfg,
+        )
+        faith_score = triad.faithfulness
+        trace.answer_relevance = triad.answer_relevance
+        trace.context_relevance = triad.context_relevance
+        trace.answer_faithfulness = faith_score
+        trace.triad_pass = triad.passed
+        trace.triage_action = ";".join(triad.triage_actions)
+        if not triad.passed:
+            log.warning(
+                "[RAG Triad] low=%s actions=%s",
+                list(triad.low_metrics), list(triad.triage_actions),
+            )
+
+        validated = (
+            self.cfg.critic_enabled
+            and critic_result["verdict"] == "PASS"
+            and triad.passed
+        )
         critic_metadata = {
             "initial_answer": generated_answer,
             "final_answer": answer,
@@ -936,8 +977,8 @@ class ProductionRAGPipeline:
             "repair_mode": repair_mode,
             "repair_attempts": repair_attempts,
             "validated": validated,
+            "rag_triad": triad.as_dict(),
         }
-        trace.answer_faithfulness = faith_score
 
         sources = [self._source_provenance(c, i) for i, c in enumerate(chunks, 1)]
         multimodal_usage = self._usage_from_sources(
@@ -961,10 +1002,13 @@ class ProductionRAGPipeline:
         self.metrics.record(trace)
         if conversation_id:
             self.memory.add_message(conversation_id, "assistant", answer)
-        self.rewriter.record_answer_score(rewrite_id, faith_score)
-        if faith_score >= self.cfg.rewriter_helpful_min_score:
+        triad_score = min(
+            triad.answer_relevance, triad.context_relevance, triad.faithfulness
+        )
+        self.rewriter.record_answer_score(rewrite_id, triad_score)
+        if triad_score >= self.cfg.rewriter_helpful_min_score:
             self.rewriter.record_feedback(rewrite_id, helpful=True)
-        elif faith_score < self.cfg.rewriter_unhelpful_max_score:
+        elif triad_score < self.cfg.rewriter_unhelpful_max_score:
             self.rewriter.record_feedback(rewrite_id, helpful=False)
 
         self._query_count += 1
@@ -984,8 +1028,13 @@ class ProductionRAGPipeline:
                 "generation_ms": trace.latency_ms(trace.t_rerank, trace.t_generation),
                 "top_rerank_score": trace.top_rerank_score,
                 "mean_rerank_score": trace.mean_rerank_score,
+                "answer_relevance": triad.answer_relevance,
+                "context_relevance": triad.context_relevance,
                 "faithfulness": faith_score,
+                "triad_pass": triad.passed,
+                "triage_actions": list(triad.triage_actions),
                 "critic_groundedness": critic_details.get("groundedness", "N/A"),
+                "critic_answer_relevance": critic_details.get("answer_relevance", "N/A"),
                 "critic_completeness": critic_details.get("completeness", "N/A"),
                 "critic_relevance": critic_details.get("relevance", "N/A"),
                 "chunks_used": len(chunks), "bm25_overlap": trace.bm25_overlap,

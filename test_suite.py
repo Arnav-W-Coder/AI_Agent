@@ -37,7 +37,7 @@ from config import RAGConfig
 from db import Database
 from memory import ConversationMemory
 from cache import CacheLayer, _cosine_sim, _emb_to_bytes, _bytes_to_emb
-from metrics import MetricsRecorder, QueryTrace
+from metrics import MetricsRecorder, QueryTrace, assess_rag_triad
 from chunking import HierarchicalChunker, ChunkRecord
 from langchain_core.documents import Document
 from url_evaluator import evaluate_url, normalize_url
@@ -150,6 +150,22 @@ class TestDatabase:
             chunk_columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
         assert {"doc_id", "chroma_id", "page_number", "file_path", "caption", "markdown"}.issubset(columns)
         assert "image_path" in chunk_columns
+
+    @pytest.mark.layer1
+    def test_query_metrics_has_rag_triad_columns(self, db: Database):
+        with db.connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(query_metrics)")}
+        assert {
+            "answer_relevance", "context_relevance", "answer_faithfulness",
+            "triad_pass", "triage_action",
+        }.issubset(columns)
+
+    @pytest.mark.layer1
+    def test_deterministic_temperature_defaults(self, cfg: RAGConfig):
+        assert cfg.llm_temperature == 0.0
+        assert cfg.rewriter_temperature == 0.0
+        assert cfg.critic_temperature == 0.0
+        assert cfg.vlm_temperature == 0.0
 
     @pytest.mark.layer1
     def test_markdown_table_detection(self):
@@ -397,7 +413,11 @@ class TestMetrics:
         t.num_chunks_retrieved = 4
         t.mean_rerank_score    = rerank_score
         t.top_rerank_score     = rerank_score + 0.05
-        t.answer_faithfulness  = 0.9
+        t.answer_relevance    = 1.0
+        t.context_relevance   = 1.0
+        t.answer_faithfulness = 0.9
+        t.triad_pass           = True
+        t.triage_action        = ""
         return t
 
     @pytest.mark.layer1
@@ -426,7 +446,10 @@ class TestMetrics:
             metrics.record(self._make_trace(f"query {i}", rerank_score=0.7))
         report = metrics.report(last_n=10)
         assert "latency_ms" in report
+        assert "rag_triad" in report
         assert report["latency_ms"]["total_avg"] == pytest.approx(2000.0, abs=10.0)
+        assert report["rag_triad"]["mean_answer_relevance"] == 1.0
+        assert report["rag_triad"]["pass_pct"] == 100.0
 
     @pytest.mark.layer1
     def test_drift_not_triggered_below_threshold(self,
@@ -622,17 +645,30 @@ class TestCriticAndAnswerControls:
         assert critic.last_details["groundedness"] == "PASS"
 
     @pytest.mark.layer1
-    def test_critic_parses_three_dimensions_and_claims(self, critic):
+    def test_critic_parses_rag_triad_dimensions_and_claims(self, critic):
         result = critic._parse_critic_output(
-            "GROUNDEDNESS: FAIL\nCOMPLETENESS: PASS\nRELEVANCE: PASS\n"
+            "GROUNDEDNESS: FAIL\nANSWER_RELEVANCE: PASS\n"
+            "COMPLETENESS: PASS\nRELEVANCE: PASS\n"
             "SCORE: 0.25\nISSUES:\n- unsupported date\n- invented name"
         )
         assert result["verdict"] == "HALLUCINATED"
         assert result["severity"] == "major"
         assert result["unsupported_claims"] == ["unsupported date", "invented name"]
         assert critic.last_details == {
-            "groundedness": "FAIL", "completeness": "PASS", "relevance": "PASS"
+            "groundedness": "FAIL", "answer_relevance": "PASS",
+            "completeness": "PASS", "relevance": "PASS"
         }
+
+    @pytest.mark.layer1
+    def test_answer_relevance_failure_is_minor_and_repairable(self, critic):
+        result = critic._parse_critic_output(
+            "GROUNDEDNESS: PASS\nANSWER_RELEVANCE: FAIL\n"
+            "COMPLETENESS: PASS\nRELEVANCE: PASS\n"
+            "SCORE: 0.7\nISSUES:\n- answer drifts away from the question"
+        )
+        assert result["verdict"] == "HALLUCINATED"
+        assert result["severity"] == "minor"
+        assert critic.last_details["answer_relevance"] == "FAIL"
 
     @pytest.mark.layer1
     def test_polish_and_faithfulness_use_production_logic(self, critic):
@@ -894,6 +930,84 @@ class TestCriticUncertaintyDetection:
         assert _compute_faithfulness("HALLUCINATED", "• a\n• b\n• c\n• d\n• e\n• f") == 0.0
 
 
+class TestRAGTriadDiagnostics:
+    """Diagram-aligned routing: answer relevance, context relevance, faithfulness."""
+
+    @pytest.mark.layer1
+    def test_all_three_checks_pass(self, cfg):
+        result = assess_rag_triad(
+            critic_details={
+                "groundedness": "PASS", "answer_relevance": "PASS",
+                "relevance": "PASS", "completeness": "PASS",
+            },
+            critic_verdict="PASS", answerable=True, abstained=False, cfg=cfg,
+        )
+        assert result.passed is True
+        assert result.low_metrics == ()
+        assert result.triage_actions == ()
+
+    @pytest.mark.layer1
+    def test_low_answer_relevance_routes_to_rewrite_and_prompt(self, cfg):
+        result = assess_rag_triad(
+            critic_details={
+                "groundedness": "PASS", "answer_relevance": "FAIL",
+                "relevance": "PASS",
+            },
+            critic_verdict="HALLUCINATED", answerable=True, abstained=False, cfg=cfg,
+        )
+        assert result.low_metrics == ("answer_relevance",)
+        assert result.triage_actions == ("optimize_rewrite_and_prompt_variance",)
+
+    @pytest.mark.layer1
+    def test_low_context_relevance_routes_to_retrieval_tuning(self, cfg):
+        result = assess_rag_triad(
+            critic_details={
+                "groundedness": "PASS", "answer_relevance": "PASS",
+                "relevance": "FAIL",
+            },
+            critic_verdict="HALLUCINATED", answerable=False, abstained=False, cfg=cfg,
+        )
+        assert result.low_metrics == ("context_relevance",)
+        assert result.triage_actions == ("tune_embeddings_and_reranker_alignment",)
+
+    @pytest.mark.layer1
+    def test_low_faithfulness_routes_to_prompt_constraints_temperature(self, cfg):
+        result = assess_rag_triad(
+            critic_details={
+                "groundedness": "FAIL", "answer_relevance": "PASS",
+                "relevance": "PASS",
+            },
+            critic_verdict="HALLUCINATED", answerable=True, abstained=False, cfg=cfg,
+        )
+        assert result.low_metrics == ("faithfulness",)
+        assert result.triage_actions == ("tighten_prompt_constraints_and_temperature",)
+
+    @pytest.mark.layer1
+    def test_abstention_does_not_create_false_answer_relevance_failure(self, cfg):
+        result = assess_rag_triad(
+            critic_details={
+                "groundedness": "PASS", "answer_relevance": "N/A",
+                "relevance": "N/A",
+            },
+            critic_verdict="PASS", answerable=False, abstained=True, cfg=cfg,
+        )
+        assert result.answer_relevance == 1.0
+        assert result.faithfulness == 1.0
+        assert result.context_relevance == 0.0
+        assert result.low_metrics == ("context_relevance",)
+
+    @pytest.mark.layer1
+    def test_same_signals_produce_identical_assessment(self, cfg):
+        kwargs = dict(
+            critic_details={
+                "groundedness": "PASS", "answer_relevance": "PASS",
+                "relevance": "PASS",
+            },
+            critic_verdict="PASS", answerable=True, abstained=False, cfg=cfg,
+        )
+        assert assess_rag_triad(**kwargs) == assess_rag_triad(**kwargs)
+
+
 # ── Inlined BM25 logic from retrieval.py (no sentence_transformers needed) ───
 
 import re as _re
@@ -1006,6 +1120,18 @@ class TestOriginalQuestionReranking:
             ("How does the protocol work?", "weak evidence"),
         ]
         assert results[0]["text"] == "strong evidence"
+
+    @pytest.mark.layer1
+    def test_equal_scores_have_stable_source_order_and_context_only_last(self):
+        from retrieval import stable_chunk_sort_key
+
+        chunks = [
+            {"filename": "b.pdf", "page_number": 1, "rerank_score": -2.0, "text": "B"},
+            {"filename": "a.pdf", "page_number": 1, "rerank_score": -2.0, "text": "A"},
+            {"filename": "context.pdf", "page_number": 1, "context_only": True, "text": "neighbor"},
+        ]
+        ordered = sorted(chunks, key=stable_chunk_sort_key)
+        assert [item["filename"] for item in ordered] == ["a.pdf", "b.pdf", "context.pdf"]
 
     @pytest.mark.layer1
     def test_generation_request_builds_evidence_query(self):
@@ -1215,7 +1341,7 @@ class TestCriticWithLLM:
     def critic(self, cfg: RAGConfig):
         from langchain_ollama import ChatOllama
         from critic import CriticAndRepair
-        return CriticAndRepair(ChatOllama(model=cfg.llm_model, num_ctx=4096))
+        return CriticAndRepair(ChatOllama(model=cfg.llm_model, num_ctx=4096, temperature=cfg.critic_temperature))
 
     @pytest.mark.xfail(
         strict=False,
@@ -1363,7 +1489,7 @@ class TestRewriterWithLLM:
     def test_rewrite_returns_longer_query(self, db: Database, cfg: RAGConfig):
         from langchain_ollama import ChatOllama
         from rewriter import QueryRewriter
-        llm = ChatOllama(model=cfg.llm_model, num_ctx=4096)
+        llm = ChatOllama(model=cfg.llm_model, num_ctx=4096, temperature=cfg.rewriter_temperature)
         rw  = QueryRewriter(db, cfg, llm)
         rid, rewritten = rw.rewrite("what is RAG")
         assert isinstance(rid, int)
@@ -1372,7 +1498,7 @@ class TestRewriterWithLLM:
     def test_rewrite_stored_in_db(self, db: Database, cfg: RAGConfig):
         from langchain_ollama import ChatOllama
         from rewriter import QueryRewriter
-        llm = ChatOllama(model=cfg.llm_model, num_ctx=4096)
+        llm = ChatOllama(model=cfg.llm_model, num_ctx=4096, temperature=cfg.rewriter_temperature)
         rw  = QueryRewriter(db, cfg, llm)
         rid, _ = rw.rewrite("test query")
         with db.connect() as conn:

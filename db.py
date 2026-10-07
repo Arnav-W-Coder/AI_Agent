@@ -115,7 +115,11 @@ CREATE TABLE IF NOT EXISTS query_metrics (
     top_rerank_score REAL,
     bm25_overlap INTEGER DEFAULT 0,
     user_rating INTEGER DEFAULT NULL,
+    answer_relevance REAL DEFAULT NULL,
+    context_relevance REAL DEFAULT NULL,
     answer_faithfulness REAL DEFAULT NULL,
+    triad_pass INTEGER DEFAULT NULL,
+    triage_action TEXT DEFAULT '',
     created_at REAL NOT NULL
 );
 
@@ -180,6 +184,16 @@ class Database:
             answer_columns = {r["name"] for r in conn.execute("PRAGMA table_info(answer_cache)").fetchall()}
             if "answer_metadata_json" not in answer_columns:
                 conn.execute("ALTER TABLE answer_cache ADD COLUMN answer_metadata_json TEXT DEFAULT '{}'")
+            metric_columns = {r["name"] for r in conn.execute("PRAGMA table_info(query_metrics)").fetchall()}
+            metric_migrations = {
+                "answer_relevance": "ALTER TABLE query_metrics ADD COLUMN answer_relevance REAL DEFAULT NULL",
+                "context_relevance": "ALTER TABLE query_metrics ADD COLUMN context_relevance REAL DEFAULT NULL",
+                "triad_pass": "ALTER TABLE query_metrics ADD COLUMN triad_pass INTEGER DEFAULT NULL",
+                "triage_action": "ALTER TABLE query_metrics ADD COLUMN triage_action TEXT DEFAULT ''",
+            }
+            for name, statement in metric_migrations.items():
+                if name not in metric_columns:
+                    conn.execute(statement)
 
     @contextmanager
     def connect(self) -> Generator[sqlite3.Connection, None, None]:

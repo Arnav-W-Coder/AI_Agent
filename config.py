@@ -15,6 +15,13 @@ class RAGConfig:
     critic_model: str | None = None
     rewriter_model: str | None = None
 
+    # Deterministic generation/evaluation defaults. Keep these at 0 for
+    # reproducible RAG outputs; tune explicitly only when variability is desired.
+    llm_temperature: float = 0.0
+    rewriter_temperature: float = 0.0
+    critic_temperature: float = 0.0
+    vlm_temperature: float = 0.0
+
     # Paths
     docs_dir: Path = field(default_factory=lambda: Path("./docs"))
     chroma_dir: Path = field(default_factory=lambda: Path("./chroma_db"))
@@ -107,7 +114,14 @@ class RAGConfig:
     critic_max_repair_attempts: int = 1
     critic_abstain_on_failed_repair: bool = False
     critic_require_context_grounding: bool = True
-    critic_config_version: int = 3
+    critic_config_version: int = 4
+
+    # RAG triad diagnostics (Answer Relevance / Context Relevance / Faithfulness)
+    triad_enabled: bool = True
+    triad_answer_relevance_min: float = 1.0
+    triad_context_relevance_min: float = 1.0
+    triad_faithfulness_min: float = 1.0
+    triad_config_version: int = 1
 
     # Rewriter
     rewrite_enabled: bool = True
