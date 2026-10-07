@@ -322,7 +322,12 @@ class ProductionRAGPipeline:
             for chunk in remaining:
                 source = chunk.get("source_url") or chunk.get("filename") or chunk.get("chroma_id") or "unknown"
                 domain = urlsplit(source).hostname if "://" in source else source
-                if source_counts.get(source, 0) < max_per_source and domain_counts.get(domain, 0) < max_per_domain:
+                source_cap = (
+                    max_per_source
+                    if chunk.get("source_type") == "web"
+                    else max(4, max_per_source)
+                )
+                if source_counts.get(source, 0) < source_cap and domain_counts.get(domain, 0) < max_per_domain:
                     eligible.append((chunk, source, domain))
             if not eligible:
                 break
@@ -633,8 +638,9 @@ class ProductionRAGPipeline:
             rounds += 1
             scrape_stats = getattr(self, "_last_web_scrape_stats", {})
             fetched_urls = scrape_stats.get("fetched_urls", [])
+            used_urls = scrape_stats.get("used_urls", fetched_urls)
             network_sources += len(fetched_urls)
-            seen_urls.update(fetched_urls)
+            seen_urls.update(used_urls)
 
             candidates = []
             seen = set()
@@ -736,7 +742,7 @@ class ProductionRAGPipeline:
         }
         self._last_web_scrape_stats = {
             "query": "", "requested_urls": 0, "fetched_urls": [],
-            "new_chunks": 0,
+            "used_urls": [], "cache_hits": 0, "new_chunks": 0,
         }
 
     async def setup(self) -> dict:
@@ -788,6 +794,7 @@ class ProductionRAGPipeline:
             if generation_request else question
         )
         trace.query_text = question
+        trace.t_rewrite = time.time()
         log.info("\n[Query] '%s'", question[:80])
         query_emb = self._embed_query(question)
         query_type = self._classify_query(question)
@@ -811,7 +818,6 @@ class ProductionRAGPipeline:
         rewritten = "\n".join(retrieval_queries)
         if generation_request:
             log.info("[Query] Generation request; evidence query: %s", evidence_query)
-        trace.t_rewrite = time.time()
         trace.rewritten_query = rewritten
         answer_cache_key = (
             f"question={question}\nrewritten_query={rewritten}\n"
@@ -828,7 +834,11 @@ class ProductionRAGPipeline:
             cached_answer, cached_sources, _ = cached
             trace.answer_cache_hit = True
             log.info("[Cache] Using cached answer as supplemental conversational context")
-        cached_chunks = self.cache.get_retrieval(rewritten)
+        retrieval_cache_key = (
+            f"{rewritten}\n"
+            f"retrieval_cache_schema_version={self.cfg.retrieval_cache_schema_version}"
+        )
+        cached_chunks = self.cache.get_retrieval(retrieval_cache_key)
         bm25_ids: set = set()
         dense_ids: set = set()
         web_scrape_used = False
@@ -928,7 +938,7 @@ class ProductionRAGPipeline:
             safe_chunks = [{k: v for k, v in c.items()
                             if isinstance(v, (str, int, float, bool, type(None), list))} for c in chunks]
             if self._combined_evidence_is_answerable(question, chunks):
-                self.cache.set_retrieval(rewritten, safe_chunks)
+                self.cache.set_retrieval(retrieval_cache_key, safe_chunks)
             else:
                 log.info("[Cache] Skipping weak retrieval result")
 
@@ -1417,9 +1427,17 @@ class ProductionRAGPipeline:
             requested_urls, len(candidates), rejected_urls, len(excluded),
         )
 
+        cached_urls = []
+        fetch_candidates = []
+        for result in candidates:
+            if self.web_store.is_fresh(result["href"]):
+                cached_urls.append(result["href"])
+            else:
+                fetch_candidates.append(result)
+
         fetched_results = []
         fetch_workers = max(
-            1, min(len(candidates) or 1, int(self.cfg.web_fetch_workers))
+            1, min(len(fetch_candidates) or 1, int(self.cfg.web_fetch_workers))
         )
         with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
             futures = {
@@ -1429,7 +1447,7 @@ class ProductionRAGPipeline:
                     query,
                     result.get("domain_score", 0),
                 ): result
-                for result in candidates
+                for result in fetch_candidates
             }
             for future, result in futures.items():
                 try:
@@ -1471,6 +1489,8 @@ class ProductionRAGPipeline:
             "query": query,
             "requested_urls": requested_urls,
             "fetched_urls": fetched_urls,
+            "used_urls": list(dict.fromkeys([*cached_urls, *fetched_urls])),
+            "cache_hits": len(cached_urls),
             "new_chunks": new_chunks,
         }
         log.info(
