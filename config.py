@@ -120,6 +120,7 @@ class RAGConfig:
     # Critic
     critic_enabled: bool = True
     critic_on_low_confidence_only: bool = True
+    critic_on_generation_requests: bool = True
     critic_uncertainty_threshold: float = 0.50
     critic_claim_penalty: float = 0.20
     critic_polish_enabled: bool = False
@@ -144,6 +145,7 @@ class RAGConfig:
     rewrite_only_when_ambiguous: bool = True
     rewriter_helpful_min_score: float = 0.80
     rewriter_unhelpful_max_score: float = 0.40
+    practice_max_problems: int = 6
 
     # Chunking
     chunk_size: int = 500
