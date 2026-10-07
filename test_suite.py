@@ -1110,7 +1110,7 @@ class TestPracticeIntentVariants:
     def test_practice_test_subject_is_extracted(self):
         from pipeline import ProductionRAGPipeline
         query = "give me some practice test problems for my physics fluids final"
-        assert ProductionRAGPipeline._generation_retrieval_query(query) == "my physics fluids final"
+        assert ProductionRAGPipeline._generation_retrieval_query(query) == "physics fluids"
 
 
 class TestAdaptiveLatencyControls:
