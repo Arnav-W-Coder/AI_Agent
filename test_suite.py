@@ -1092,6 +1092,27 @@ class TestSemanticAnswerabilityOverride:
         ) == "comparison"
 
 
+class TestPracticeIntentVariants:
+    @pytest.mark.layer1
+    @pytest.mark.parametrize("query", [
+        "give me some practice test problems for my physics fluids final",
+        "make me a mock exam for fluids",
+        "give me final review questions for fluids",
+        "create a worksheet for fluid mechanics",
+    ])
+    def test_study_artifact_variants_are_practice_generation(self, query):
+        from pipeline import ProductionRAGPipeline
+        assert ProductionRAGPipeline._is_practice_request(query) is True
+        assert ProductionRAGPipeline._classify_query(query) == "practice"
+        assert ProductionRAGPipeline._is_generation_request(query) is True
+
+    @pytest.mark.layer1
+    def test_practice_test_subject_is_extracted(self):
+        from pipeline import ProductionRAGPipeline
+        query = "give me some practice test problems for my physics fluids final"
+        assert ProductionRAGPipeline._generation_retrieval_query(query) == "my physics fluids final"
+
+
 class TestAdaptiveLatencyControls:
     """Fast-path critic policy and bounded adaptive web loop."""
 
