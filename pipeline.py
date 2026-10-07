@@ -309,6 +309,13 @@ class ProductionRAGPipeline:
             query,
             flags=re.IGNORECASE,
         )
+        query = re.sub(r"^\s*my\s+", "", query, flags=re.IGNORECASE)
+        query = re.sub(
+            r"\s+(?:final|midterm|exam|test)\s*$",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        )
         query = re.sub(r"\s+", " ", query).strip(" .?!")
         query = ProductionRAGPipeline._study_topic_query(query)
         return query or question.strip()
