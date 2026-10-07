@@ -1445,7 +1445,7 @@ class TestOriginalQuestionReranking:
 
         query = "give me practice problems for fluids physics 2c"
         assert ProductionRAGPipeline._is_generation_request(query) is True
-        assert ProductionRAGPipeline._generation_retrieval_query(query) == "fluids physics 2c" or ProductionRAGPipeline._generation_retrieval_query(query) == "fluids"
+        assert ProductionRAGPipeline._generation_retrieval_query(query) == "fluids"
         assert ProductionRAGPipeline._classify_query(query) == "practice"
 
     @pytest.mark.layer1
