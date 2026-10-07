@@ -350,26 +350,61 @@ class ProductionRAGPipeline:
         return selected
 
     @staticmethod
-    def _query_evidence_terms(question: str) -> set[str]:
+    def _normalize_evidence_token(term: str) -> str:
+        """Normalize light English morphology for lexical answerability checks."""
+        token = (term or "").lower().strip()
+        if len(token) <= 3:
+            return token
+        if token.endswith("ies") and len(token) > 4:
+            return token[:-3] + "y"
+        if token.endswith(("sses", "xes", "zes", "ches", "shes")) and len(token) > 5:
+            return token[:-2]
+        if token.endswith("ses") and len(token) > 4:
+            return token[:-2]
+        if token.endswith("s") and not token.endswith(("ss", "us", "is")) and len(token) > 4:
+            return token[:-1]
+        return token
+
+    @classmethod
+    def _evidence_terms(cls, text: str) -> set[str]:
+        """Extract content-bearing normalized terms, excluding query glue/contractions."""
         stop_words = {
-            "a", "an", "and", "are", "be", "does", "do", "for", "how",
-            "is", "me", "of", "please", "the", "to", "what", "which",
+            "a", "an", "and", "are", "be", "been", "being", "but", "can",
+            "could", "did", "do", "does", "for", "from", "had", "has", "have",
+            "how", "is", "isn", "it", "its", "me", "not", "of", "please",
+            "should", "than", "that", "the", "their", "them", "then", "there",
+            "these", "they", "this", "to", "was", "were", "what", "when",
+            "where", "which", "who", "why", "will", "with", "would",
         }
+        raw_terms = re.findall(r"[a-z0-9]+", (text or "").lower())
         return {
-            term for term in re.findall(r"[a-z0-9]+", question.lower())
+            cls._normalize_evidence_token(term)
+            for term in raw_terms
             if len(term) > 2 and term not in stop_words
         }
 
-    def _has_query_evidence(self, question: str, chunks: list[dict]) -> bool:
+    @classmethod
+    def _query_evidence_terms(cls, question: str) -> set[str]:
+        return cls._evidence_terms(question)
+
+    def _query_evidence_coverage(self, question: str, chunks: list[dict]) -> tuple[float, set[str], set[str]]:
         terms = self._query_evidence_terms(question)
         if not terms:
-            return bool(chunks)
-        evidence = " ".join(
-            str(chunk.get("text", chunk.get("text_preview", ""))).lower()
-            for chunk in chunks
-            if not chunk.get("context_only")
-        )
-        coverage = sum(term in evidence for term in terms) / len(terms)
+            return (1.0 if chunks else 0.0), terms, set()
+        evidence_terms: set[str] = set()
+        for chunk in chunks:
+            if chunk.get("context_only"):
+                continue
+            evidence_terms.update(
+                self._evidence_terms(
+                    str(chunk.get("text", chunk.get("text_preview", "")))
+                )
+            )
+        matched = terms & evidence_terms
+        return len(matched) / len(terms), terms, matched
+
+    def _has_query_evidence(self, question: str, chunks: list[dict]) -> bool:
+        coverage, _, _ = self._query_evidence_coverage(question, chunks)
         return coverage >= self.cfg.answerability_min_query_term_coverage
 
     def _answerability_debug(self, chunks: list[dict], question: str) -> dict:
@@ -389,12 +424,18 @@ class ProductionRAGPipeline:
             sum(strongest_scores) / len(strongest_scores)
             if strongest_scores else 0.0
         )
+        coverage, query_terms, matched_terms = self._query_evidence_coverage(
+            question, score_chunks
+        )
         return {
             "chunk_count": len(chunks),
             "scoreable_chunk_count": len(score_chunks),
             "top_score": scores[0] if scores else None,
             "all_chunk_mean": sum(scores) / len(scores) if scores else None,
             "strongest_chunk_mean": mean_score,
+            "query_terms": sorted(query_terms),
+            "matched_query_terms": sorted(matched_terms),
+            "query_term_coverage": round(coverage, 3),
             "top_score_pass": bool(
                 scores
                 and scores[0] >= self.cfg.answerability_min_top_score
@@ -446,14 +487,7 @@ class ProductionRAGPipeline:
         usable = [chunk for chunk in web_candidates if not chunk.get("context_only")]
         if len(usable) < getattr(self.cfg, "web_min_candidates", 2):
             return False
-        terms = self._query_evidence_terms(question)
-        if not terms:
-            return True
-        evidence = " ".join(
-            str(chunk.get("text", chunk.get("text_preview", ""))).lower()
-            for chunk in usable
-        )
-        coverage = sum(term in evidence for term in terms) / len(terms)
+        coverage, _, _ = self._query_evidence_coverage(question, usable)
         return coverage >= self.cfg.web_min_query_relevance
 
     def _combined_evidence_is_answerable(self, question: str,
@@ -616,6 +650,69 @@ class ProductionRAGPipeline:
         stop_reason = "max_rounds"
         started = time.perf_counter()
 
+        # Persistent web evidence is cheaper than another search/fetch cycle.
+        # Reuse it first, rerank against the current question, and stop immediately
+        # if the cached evidence already clears the same answerability gate.
+        web_store = getattr(self, "web_store", None)
+        cached_web = (
+            web_store.search(
+                question,
+                k=min(self.cfg.web_top_k, max(limit, self.cfg.answerability_min_chunks)),
+            )
+            if web_store is not None else []
+        )
+        if cached_web:
+            cached_candidates = []
+            cached_seen = set()
+            for chunk in [*current, *cached_web]:
+                key = (
+                    f"{chunk.get('source_type', 'pdf')}:"
+                    f"{chunk.get('chroma_id') or chunk.get('source_url', chunk.get('filename', ''))}:"
+                    f"{chunk.get('text', '')[:100]}"
+                )
+                if key not in cached_seen:
+                    cached_seen.add(key)
+                    cached_candidates.append(chunk)
+            cached_reranked = self.reranker.rerank_against_original(
+                rerank_query or question,
+                cached_candidates,
+                max(limit * 2, limit + 2),
+                self.cfg.min_rerank_score,
+            )
+            cached_pdf = [
+                chunk for chunk in cached_reranked
+                if chunk.get("source_type") != "web"
+            ]
+            cached_web_winners = [
+                chunk for chunk in cached_reranked
+                if chunk.get("source_type") == "web"
+            ]
+            cached_expanded_pdf = self.retriever.expand_to_context(cached_pdf)
+            cached_recovered = sorted(
+                cached_expanded_pdf + cached_web_winners,
+                key=stable_chunk_sort_key,
+            )
+            cached_current = self._diversify_sources(
+                cached_recovered, query_type, limit
+            )
+            if self._combined_evidence_is_answerable(question, cached_current):
+                self._last_adaptive_web_usage = {
+                    "enabled": adaptive,
+                    "rounds": 0,
+                    "network_sources": 0,
+                    "cache_chunks": len(cached_web),
+                    "stop_reason": "web_cache_answerable",
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                }
+                log.info("[AdaptiveWeb] %s", self._last_adaptive_web_usage)
+                return cached_current
+            current = cached_current
+            seen_urls.update(
+                chunk.get("source_url") or chunk.get("filename")
+                for chunk in cached_web
+                if chunk.get("source_url") or chunk.get("filename")
+            )
+
         for round_index in range(max_rounds):
             if network_sources >= hard_cap:
                 stop_reason = "source_cap"
@@ -685,6 +782,7 @@ class ProductionRAGPipeline:
             "enabled": adaptive,
             "rounds": rounds,
             "network_sources": network_sources,
+            "cache_chunks": len(cached_web),
             "stop_reason": stop_reason,
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
         }
@@ -737,7 +835,7 @@ class ProductionRAGPipeline:
         }
         self._last_adaptive_web_usage = {
             "enabled": bool(getattr(cfg, "adaptive_web_enabled", True)),
-            "rounds": 0, "network_sources": 0,
+            "rounds": 0, "network_sources": 0, "cache_chunks": 0,
             "stop_reason": "not_run", "elapsed_ms": 0.0,
         }
         self._last_web_scrape_stats = {
@@ -777,7 +875,7 @@ class ProductionRAGPipeline:
         trace = QueryTrace(query_text=original_question)
         self._last_adaptive_web_usage = {
             "enabled": bool(getattr(self.cfg, "adaptive_web_enabled", True)),
-            "rounds": 0, "network_sources": 0,
+            "rounds": 0, "network_sources": 0, "cache_chunks": 0,
             "stop_reason": "not_run", "elapsed_ms": 0.0,
         }
         self._last_web_scrape_stats = {

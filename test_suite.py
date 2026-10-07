@@ -962,6 +962,38 @@ class TestCriticUncertaintyDetection:
         assert _compute_faithfulness("HALLUCINATED", "• a\n• b\n• c\n• d\n• e\n• f") == 0.0
 
 
+class TestAnswerabilityLexicalNormalization:
+    """Answerability should not fail on contractions, glue words or simple plurals."""
+
+    @pytest.mark.layer1
+    def test_liquid_query_terms_drop_contraction_noise_and_singularize(self):
+        from pipeline import ProductionRAGPipeline
+        terms = ProductionRAGPipeline._query_evidence_terms(
+            "how are liquids incompressible but air isn't"
+        )
+        assert "liquid" in terms
+        assert "incompressible" in terms
+        assert "air" in terms
+        assert "but" not in terms
+        assert "isn" not in terms
+        assert "liquids" not in terms
+
+    @pytest.mark.layer1
+    def test_liquid_evidence_passes_query_coverage(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        chunks = [{
+            "text": "A liquid is treated as incompressible because its volume changes very little under ordinary pressure.",
+            "rerank_score": 3.9,
+        }]
+        coverage, terms, matched = instance._query_evidence_coverage(
+            "how are liquids incompressible but air isn't", chunks
+        )
+        assert coverage >= cfg.answerability_min_query_term_coverage
+        assert {"liquid", "incompressible"}.issubset(matched)
+
+
 class TestAdaptiveLatencyControls:
     """Fast-path critic policy and bounded adaptive web loop."""
 
@@ -978,6 +1010,57 @@ class TestAdaptiveLatencyControls:
         assert instance._should_run_critic(
             low_confidence=True, answerable=True
         ) is True
+
+    @pytest.mark.layer1
+    def test_adaptive_web_uses_persistent_cache_before_network(self, cfg):
+        from pipeline import ProductionRAGPipeline
+
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.adaptive_web_enabled = True
+        cfg.adaptive_web_max_rounds = 2
+
+        cached = [
+            {
+                "source_type": "web", "source_url": "https://cached-a.example",
+                "text": "A liquid is nearly incompressible.", "rerank_score": 4.0,
+            },
+            {
+                "source_type": "web", "source_url": "https://cached-b.example",
+                "text": "Air is compressible.", "rerank_score": 3.5,
+            },
+        ]
+
+        class FakeWebStore:
+            def search(self, _query, k):
+                return cached[:k]
+        class FakeReranker:
+            def rerank_against_original(self, _q, candidates, _k, _min):
+                return candidates
+        class FakeRetriever:
+            def expand_to_context(self, chunks):
+                return chunks
+
+        instance.web_store = FakeWebStore()
+        instance.reranker = FakeReranker()
+        instance.retriever = FakeRetriever()
+        instance._combined_evidence_is_answerable = lambda _q, chunks: len(chunks) >= 2
+        instance._web_scrape_chunks = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("network scrape should not run when cached web evidence is sufficient")
+        )
+
+        result = instance._broader_web_retrieval(
+            "how are liquids incompressible but air isn't",
+            ["how are liquids incompressible but air isn't"],
+            [],
+            "explanation",
+            6,
+        )
+
+        assert len(result) == 2
+        assert instance._last_adaptive_web_usage["rounds"] == 0
+        assert instance._last_adaptive_web_usage["network_sources"] == 0
+        assert instance._last_adaptive_web_usage["stop_reason"] == "web_cache_answerable"
 
     @pytest.mark.layer1
     def test_adaptive_web_stops_after_first_sufficient_round(self, cfg):
