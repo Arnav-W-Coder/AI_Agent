@@ -28,10 +28,10 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class RAGTriadAssessment:
     """Deterministic routing result for the RAG troubleshooting triad."""
-    answer_relevance: float
-    context_relevance: float
-    faithfulness: float
-    passed: bool
+    answer_relevance: Optional[float]
+    context_relevance: Optional[float]
+    faithfulness: Optional[float]
+    passed: Optional[bool]
     low_metrics: tuple[str, ...]
     triage_actions: tuple[str, ...]
 
@@ -56,7 +56,8 @@ def _critic_signal(value: str | None, fallback: float) -> float:
 
 
 def assess_rag_triad(*, critic_details: dict, critic_verdict: str,
-                     answerable: bool, abstained: bool, cfg: RAGConfig) -> RAGTriadAssessment:
+                     answerable: bool, abstained: bool, cfg: RAGConfig,
+                     critic_evaluated: bool = True) -> RAGTriadAssessment:
     """Map existing RAG checks onto Answer Relevance / Context Relevance / Faithfulness.
 
     The critic remains the semantic judge. When the critic intentionally reports N/A
@@ -64,7 +65,17 @@ def assess_rag_triad(*, critic_details: dict, critic_verdict: str,
     pipeline state supplies the fallback so the diagnostic is still complete.
     """
     if not cfg.triad_enabled:
-        return RAGTriadAssessment(1.0, 1.0, 1.0, True, (), ())
+        return RAGTriadAssessment(None, None, None, None, (), ())
+
+    if not critic_evaluated:
+        return RAGTriadAssessment(
+            answer_relevance=None,
+            context_relevance=1.0 if answerable else 0.0,
+            faithfulness=None,
+            passed=None,
+            low_metrics=(),
+            triage_actions=(),
+        )
 
     verdict_pass = (critic_verdict or "").upper() == "PASS"
     answer_relevance = _critic_signal(
