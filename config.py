@@ -54,7 +54,7 @@ class RAGConfig:
     top_k_sparse: int = 20
     top_k_rerank: int = 8
     rrf_k: int = 60
-    min_rerank_score: float = -8.0
+    min_rerank_score: float = -7.5
     min_mean_rerank_score: float = 0.0
     min_top_rerank_score: float = 0.0
     retrieval_quality_margin: float = 0.0
@@ -162,6 +162,10 @@ class RAGConfig:
     # Query routing / confidence
     query_routing_enabled: bool = True
     recommendation_query_expansion_enabled: bool = True
+    # MS MARCO cross-encoder outputs are ranking logits, not calibrated
+    # probabilities. By default, answerability uses the reranker's own floor
+    # rather than assuming relevant scores must be >= 0.
+    answerability_use_absolute_rerank_thresholds: bool = False
     answerability_min_top_score: float = 0.0
     answerability_min_mean_score: float = -0.5
     answerability_min_chunks: int = 2

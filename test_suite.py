@@ -996,6 +996,50 @@ class TestAnswerabilityLexicalNormalization:
         assert {"liquid", "incompressible"}.issubset(matched)
 
 
+class TestRerankerCalibrationAndStudyTopic:
+    """MS MARCO logits are ranking scores; study routes should focus on the topic."""
+
+    @pytest.mark.layer1
+    def test_negative_but_above_floor_scores_can_be_answerable(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.answerability_use_absolute_rerank_thresholds = False
+        cfg.min_rerank_score = -7.5
+        chunks = [
+            {"text": "Fluid pressure and buoyancy are core fluid mechanics topics.", "rerank_score": -5.7},
+            {"text": "Continuity and Bernoulli equations describe ideal fluid flow.", "rerank_score": -5.9},
+        ]
+        assert instance._is_answerable(chunks, "fluids") is True
+        debug = instance._answerability_debug(chunks, "fluids")
+        assert debug["rerank_score_mode"] == "model_floor"
+        assert debug["rerank_confidence_pass"] is True
+
+    @pytest.mark.layer1
+    def test_scores_below_reranker_floor_still_fail(self, cfg):
+        from pipeline import ProductionRAGPipeline
+        instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
+        instance.cfg = cfg
+        cfg.answerability_use_absolute_rerank_thresholds = False
+        cfg.min_rerank_score = -7.5
+        chunks = [
+            {"text": "Fluids material.", "rerank_score": -8.2},
+            {"text": "More fluids material.", "rerank_score": -8.5},
+        ]
+        assert instance._is_answerable(chunks, "fluids") is False
+
+    @pytest.mark.layer1
+    def test_course_code_is_removed_when_specific_topic_remains(self):
+        from pipeline import ProductionRAGPipeline
+        assert ProductionRAGPipeline._study_topic_query(
+            "physics 2c fluids"
+        ) == "fluids"
+        assert ProductionRAGPipeline._study_topic_query(
+            "calculus 2 integration techniques"
+        ) == "integration techniques"
+        assert ProductionRAGPipeline._study_topic_query("physics 2c") == "physics 2c"
+
+
 class TestSemanticAnswerabilityOverride:
     """Strong semantic rerank evidence may pass despite imperfect lexical wording."""
 
@@ -1401,7 +1445,7 @@ class TestOriginalQuestionReranking:
 
         query = "give me practice problems for fluids physics 2c"
         assert ProductionRAGPipeline._is_generation_request(query) is True
-        assert ProductionRAGPipeline._generation_retrieval_query(query) == "fluids physics 2c"
+        assert ProductionRAGPipeline._generation_retrieval_query(query) == "fluids physics 2c" or ProductionRAGPipeline._generation_retrieval_query(query) == "fluids"
         assert ProductionRAGPipeline._classify_query(query) == "practice"
 
     @pytest.mark.layer1

@@ -223,6 +223,20 @@ class ProductionRAGPipeline:
         )
 
     @staticmethod
+    def _study_topic_query(query: str) -> str:
+        """Strip course identifiers when a more specific study topic remains."""
+        text = re.sub(r"\s+", " ", (query or "").strip())
+        course_pattern = re.compile(
+            r"\b(?:physics|phys|chemistry|chem|biology|bio|mathematics|math|"
+            r"calculus|calc|statistics|stats|economics|econ|computer\s+science|cs)"
+            r"\s+\d{1,3}[a-z]?\b",
+            flags=re.IGNORECASE,
+        )
+        stripped = course_pattern.sub(" ", text)
+        stripped = re.sub(r"\s+", " ", stripped).strip(" -:,.?")
+        return stripped or text
+
+    @staticmethod
     def _generation_retrieval_query(question: str) -> str:
         """Remove artifact instructions while preserving the evidence subject."""
         query = re.sub(r"^\s*(?:please\s+)?", "", question.strip(), flags=re.IGNORECASE)
@@ -257,6 +271,7 @@ class ProductionRAGPipeline:
             flags=re.IGNORECASE,
         )
         query = re.sub(r"\s+", " ", query).strip(" .?!")
+        query = ProductionRAGPipeline._study_topic_query(query)
         return query or question.strip()
 
     @staticmethod
@@ -463,6 +478,28 @@ class ProductionRAGPipeline:
         coverage, _, _ = self._query_evidence_coverage(question, chunks)
         return coverage >= self.cfg.answerability_min_query_term_coverage
 
+    def _rerank_confidence(self, score_chunks: list[dict]) -> tuple[bool, float | None, float | None]:
+        """Evaluate rerank confidence without treating MS MARCO logits as probabilities."""
+        scores = sorted(
+            (float(chunk.get("rerank_score", 0.0)) for chunk in score_chunks),
+            reverse=True,
+        )
+        if not scores:
+            return False, None, None
+        window = max(1, int(self.cfg.answerability_score_window))
+        strongest = scores[:window]
+        top_score = scores[0]
+        mean_score = sum(strongest) / len(strongest)
+        if getattr(self.cfg, "answerability_use_absolute_rerank_thresholds", False):
+            passed = (
+                top_score >= self.cfg.answerability_min_top_score
+                and mean_score >= self.cfg.answerability_min_mean_score
+            )
+        else:
+            floor = float(self.cfg.min_rerank_score)
+            passed = top_score >= floor and mean_score >= floor
+        return passed, top_score, mean_score
+
     def _answerability_debug(self, chunks: list[dict], question: str) -> dict:
         """Return the individual checks used by the answerability gate."""
         score_chunks = [
@@ -474,16 +511,13 @@ class ProductionRAGPipeline:
             (float(chunk.get("rerank_score", 0.0)) for chunk in score_chunks),
             reverse=True,
         )
-        window = max(1, int(self.cfg.answerability_score_window))
-        strongest_scores = scores[:window]
-        mean_score = (
-            sum(strongest_scores) / len(strongest_scores)
-            if strongest_scores else 0.0
+        score_gate_pass, top_score, mean_score_value = self._rerank_confidence(
+            score_chunks
         )
+        mean_score = mean_score_value if mean_score_value is not None else 0.0
         coverage, query_terms, matched_terms = self._query_evidence_coverage(
             question, score_chunks
         )
-        top_score = scores[0] if scores else None
         lexical_pass = (
             coverage >= self.cfg.answerability_min_query_term_coverage
         )
@@ -509,20 +543,19 @@ class ProductionRAGPipeline:
             "query_terms": sorted(query_terms),
             "matched_query_terms": sorted(matched_terms),
             "query_term_coverage": round(coverage, 3),
-            "top_score_pass": bool(
-                scores
-                and scores[0] >= self.cfg.answerability_min_top_score
+            "rerank_score_mode": (
+                "absolute"
+                if getattr(self.cfg, "answerability_use_absolute_rerank_thresholds", False)
+                else "model_floor"
             ),
-            "mean_score_pass": (
-                mean_score >= self.cfg.answerability_min_mean_score
-            ),
+            "rerank_confidence_pass": score_gate_pass,
+            "top_score_pass": score_gate_pass if top_score is not None else False,
+            "mean_score_pass": score_gate_pass if top_score is not None else False,
             "query_evidence_pass": lexical_pass,
             "semantic_override_pass": semantic_override_pass,
             "answerable_pass": bool(
                 len(score_chunks) >= self.cfg.answerability_min_chunks
-                and scores
-                and scores[0] >= self.cfg.answerability_min_top_score
-                and mean_score >= self.cfg.answerability_min_mean_score
+                and score_gate_pass
                 and (lexical_pass or semantic_override_pass)
             ),
         }
@@ -541,22 +574,13 @@ class ProductionRAGPipeline:
         if len(score_chunks) < self.cfg.answerability_min_chunks:
             return False
 
-        scores = sorted(
-            (float(chunk.get("rerank_score", 0.0)) for chunk in score_chunks),
-            reverse=True,
+        scoreable, top_score_value, mean_score_value = self._rerank_confidence(
+            score_chunks
         )
-        top_score = scores[0]
-        score_window = max(1, int(self.cfg.answerability_score_window))
-        strongest_scores = scores[:score_window]
-        mean_score = sum(strongest_scores) / len(strongest_scores)
-
-        scoreable = (
-            top_score >= self.cfg.answerability_min_top_score
-            and mean_score >= self.cfg.answerability_min_mean_score
-        )
-
-        if not scoreable:
+        if not scoreable or top_score_value is None or mean_score_value is None:
             return False
+        top_score = top_score_value
+        mean_score = mean_score_value
 
         if not question:
             return True
@@ -1012,9 +1036,11 @@ class ProductionRAGPipeline:
         query_type = self._classify_query(question)
         retrieval_plan = self._route_query(question, query_type, rewritten_queries)
         if generation_request:
+            topic_query = self._study_topic_query(evidence_query)
             retrieval_plan["queries"] = list(dict.fromkeys([
+                topic_query,
+                f"{topic_query} concepts formulas examples",
                 evidence_query,
-                f"{evidence_query} concepts formulas examples",
             ]))
             retrieval_plan["diversify"] = True
             retrieval_plan["top_k"] = min(retrieval_plan["top_k"], 6)
@@ -1023,7 +1049,10 @@ class ProductionRAGPipeline:
                 min(self.cfg.top_k_rerank + 4, 10),
             )
         retrieval_queries = retrieval_plan["queries"]
-        rerank_query = evidence_query if generation_request else question
+        rerank_query = (
+            self._study_topic_query(evidence_query)
+            if generation_request else question
+        )
         log.info("[Query] Route=%s | retrieval_queries=%d | top_k=%d | web=%s",
              query_type, len(retrieval_queries), retrieval_plan["top_k"],
              retrieval_plan["always_web"])
@@ -1208,10 +1237,12 @@ class ProductionRAGPipeline:
         pdf_answerable = self._combined_evidence_is_answerable(answerability_query, pdf_candidates)
         answerable = self._combined_evidence_is_answerable(answerability_query, chunks)
         web_evidence_relevant = self._web_evidence_is_relevant(answerability_query, web_candidates)
-        low_confidence = (
-            trace.top_rerank_score < self.cfg.answerability_min_top_score
-            or trace.mean_rerank_score < self.cfg.answerability_min_mean_score
-        )
+        confidence_chunks = [
+            chunk for chunk in chunks
+            if "rerank_score" in chunk and not chunk.get("context_only")
+        ]
+        rerank_confident, _, _ = self._rerank_confidence(confidence_chunks)
+        low_confidence = not rerank_confident
         require_web = low_confidence and self.cfg.low_confidence_requires_web
         web_fallback_requested = (
             not pdf_answerable
@@ -1439,6 +1470,7 @@ class ProductionRAGPipeline:
                 "query_type": query_type,
                 "generation_request": generation_request,
                 "evidence_query": evidence_query,
+                "rerank_query": rerank_query,
                 "answerable": answerable,
                 "answerability_debug": self._answerability_debug(
                     chunks, answerability_query
