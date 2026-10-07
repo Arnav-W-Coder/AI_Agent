@@ -1,10 +1,11 @@
 """
 metrics.py — Monitoring, quality measurement, and drift detection.
 
-Tracks three measurement dimensions:
-  1. Retrieval component  — rerank scores, BM25/dense overlap, chunks retrieved
-  2. Answer quality       — faithfulness (critic score), user rating (1-5)
-  3. End-to-end perf      — total/component latencies, cache hit rates
+Tracks production metrics plus the RAG troubleshooting triad:
+  1. Answer relevance     — whether the response addresses the user question
+  2. Context relevance    — whether retrieved evidence is useful for the question
+  3. Faithfulness         — whether factual claims are grounded in retrieved evidence
+  4. End-to-end perf      — latency, cache hit rates, reranking and user ratings
 
 Drift detection:
   Every `drift_window` queries, compare the mean rerank score of the recent
@@ -22,6 +23,83 @@ from db import Database
 from config import RAGConfig
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RAGTriadAssessment:
+    """Deterministic routing result for the RAG troubleshooting triad."""
+    answer_relevance: float
+    context_relevance: float
+    faithfulness: float
+    passed: bool
+    low_metrics: tuple[str, ...]
+    triage_actions: tuple[str, ...]
+
+    def as_dict(self) -> dict:
+        return {
+            "answer_relevance": self.answer_relevance,
+            "context_relevance": self.context_relevance,
+            "faithfulness": self.faithfulness,
+            "passed": self.passed,
+            "low_metrics": list(self.low_metrics),
+            "triage_actions": list(self.triage_actions),
+        }
+
+
+def _critic_signal(value: str | None, fallback: float) -> float:
+    normalized = (value or "").strip().upper()
+    if normalized == "PASS":
+        return 1.0
+    if normalized == "FAIL":
+        return 0.0
+    return float(fallback)
+
+
+def assess_rag_triad(*, critic_details: dict, critic_verdict: str,
+                     answerable: bool, abstained: bool, cfg: RAGConfig) -> RAGTriadAssessment:
+    """Map existing RAG checks onto Answer Relevance / Context Relevance / Faithfulness.
+
+    The critic remains the semantic judge. When the critic intentionally reports N/A
+    (for example, the canonical insufficient-information response), deterministic
+    pipeline state supplies the fallback so the diagnostic is still complete.
+    """
+    if not cfg.triad_enabled:
+        return RAGTriadAssessment(1.0, 1.0, 1.0, True, (), ())
+
+    verdict_pass = (critic_verdict or "").upper() == "PASS"
+    answer_relevance = _critic_signal(
+        critic_details.get("answer_relevance"),
+        1.0 if abstained else (1.0 if verdict_pass else 0.0),
+    )
+    context_relevance = _critic_signal(
+        critic_details.get("relevance"),
+        1.0 if answerable else 0.0,
+    )
+    faithfulness = _critic_signal(
+        critic_details.get("groundedness"),
+        1.0 if (abstained or verdict_pass) else 0.0,
+    )
+
+    low_metrics: list[str] = []
+    triage_actions: list[str] = []
+    if answer_relevance < cfg.triad_answer_relevance_min:
+        low_metrics.append("answer_relevance")
+        triage_actions.append("optimize_rewrite_and_prompt_variance")
+    if context_relevance < cfg.triad_context_relevance_min:
+        low_metrics.append("context_relevance")
+        triage_actions.append("tune_embeddings_and_reranker_alignment")
+    if faithfulness < cfg.triad_faithfulness_min:
+        low_metrics.append("faithfulness")
+        triage_actions.append("tighten_prompt_constraints_and_temperature")
+
+    return RAGTriadAssessment(
+        answer_relevance=answer_relevance,
+        context_relevance=context_relevance,
+        faithfulness=faithfulness,
+        passed=not low_metrics,
+        low_metrics=tuple(low_metrics),
+        triage_actions=tuple(triage_actions),
+    )
 
 
 @dataclass
@@ -49,8 +127,12 @@ class QueryTrace:
     top_rerank_score:     float = 0.0
     bm25_overlap:         int   = 0   # chunks appearing in both BM25 + dense
 
-    # Answer quality
+    # Answer quality / RAG triad
+    answer_relevance:    Optional[float] = None
+    context_relevance:   Optional[float] = None
     answer_faithfulness: Optional[float] = None
+    triad_pass:          Optional[bool]  = None
+    triage_action:       str             = ""
     user_rating:         Optional[int]   = None
 
     def latency_ms(self, t_from: Optional[float], t_to: Optional[float]) -> Optional[float]:
@@ -82,8 +164,9 @@ class MetricsRecorder:
                     answer_cache_hit, retrieval_cache_hit,
                     num_chunks_retrieved, mean_rerank_score,
                     top_rerank_score, bm25_overlap,
-                    user_rating, answer_faithfulness, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    user_rating, answer_relevance, context_relevance,
+                    answer_faithfulness, triad_pass, triage_action, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     trace.query_id, trace.query_text, trace.rewritten_query,
                     trace.total_ms(),
@@ -98,7 +181,11 @@ class MetricsRecorder:
                     trace.top_rerank_score,
                     trace.bm25_overlap,
                     trace.user_rating,
+                    trace.answer_relevance,
+                    trace.context_relevance,
                     trace.answer_faithfulness,
+                    None if trace.triad_pass is None else int(trace.triad_pass),
+                    trace.triage_action,
                     now,
                 )
             )
@@ -198,10 +285,19 @@ class MetricsRecorder:
         rerank_lats  = vals("rerank_latency_ms")
         gen_lats     = vals("generation_latency_ms")
         rerank_scores = vals("mean_rerank_score")
+        answer_rel   = vals("answer_relevance")
+        context_rel  = vals("context_relevance")
         faithful     = vals("answer_faithfulness")
+        triad_passes = vals("triad_pass")
         ratings      = vals("user_rating")
         a_hits       = [r["answer_cache_hit"]    for r in rows]
         r_hits       = [r["retrieval_cache_hit"] for r in rows]
+        triage_counts: dict[str, int] = {}
+        for row in rows:
+            action = (row["triage_action"] or "").strip()
+            if action:
+                for item in action.split(";"):
+                    triage_counts[item] = triage_counts.get(item, 0) + 1
 
         return {
             "window":           last_n,
@@ -220,6 +316,13 @@ class MetricsRecorder:
             "retrieval_quality": {
                 "mean_rerank_score": avg(rerank_scores),
                 "min_rerank_score":  min(rerank_scores) if rerank_scores else None,
+            },
+            "rag_triad": {
+                "mean_answer_relevance": avg(answer_rel),
+                "mean_context_relevance": avg(context_rel),
+                "mean_faithfulness": avg(faithful),
+                "pass_pct": pct(triad_passes),
+                "triage_counts": triage_counts,
             },
             "answer_quality": {
                 "mean_faithfulness": avg(faithful),

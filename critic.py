@@ -44,17 +44,20 @@ RETRIEVED CONTEXT:
 ANSWER:
 {answer}
 
-Evaluate three dimensions:
+Evaluate four dimensions:
 1. GROUNDEDNESS: Every factual claim must be directly supported by the context
    or by a clear synonym, paraphrase, or logically equivalent statement.
-2. COMPLETENESS: The answer should directly address the question and cover the
-   important parts that the context actually supports. Do not penalize missing
-   information that the context itself does not contain.
-3. RELEVANCE: The retrieved context must contain useful evidence for the
+2. ANSWER_RELEVANCE: The answer must directly answer the question without
+   drifting into unrelated material or substituting a different task.
+3. COMPLETENESS: The answer should cover the important parts that the context
+   actually supports. Do not penalize missing information that the context itself
+   does not contain.
+4. RELEVANCE: The retrieved context must contain useful evidence for the
    question. Judge the context itself, not writing quality.
 
 Return ONLY:
 GROUNDEDNESS: PASS or FAIL
+ANSWER_RELEVANCE: PASS or FAIL
 COMPLETENESS: PASS or FAIL
 RELEVANCE: PASS or FAIL
 SCORE: <number from 0.0 to 1.0>
@@ -163,7 +166,9 @@ class CriticAndRepair:
                 "context": context,
                 "answer": answer,
             }).strip()
-            result = self._parse_critic_output(raw)
+            result = self._parse_critic_output(
+                raw, evaluate_answer_relevance=bool((question or "").strip())
+            )
             checkpoint("critic.evaluation", result, enabled=getattr(self._cfg, "debug_checkpoints", True),
                        preview_chars=getattr(self._cfg, "checkpoint_preview_chars", 160),
                        sample_items=getattr(self._cfg, "checkpoint_sample_items", 3))
@@ -194,7 +199,7 @@ class CriticAndRepair:
                 severity: Literal["none", "minor", "major"], critique: str,
                 repairable: bool) -> CriticResult:
         # These three call sites (no context, self-admitted uncertainty, and
-        # an evaluation call that raised) never run the three-dimension
+        # an evaluation call that raised) never run the four-dimension
         # critic prompt, so completeness/relevance were never actually
         # judged. Report that honestly as "N/A" instead of omitting the keys
         # — pipeline.py's metrics were previously papering over the gap with
@@ -208,7 +213,8 @@ class CriticAndRepair:
         else:
             groundedness = "PASS" if verdict == "PASS" else "FAIL"
         self.last_details = {
-            "groundedness": groundedness, "completeness": "N/A", "relevance": "N/A",
+            "groundedness": groundedness, "answer_relevance": "N/A",
+            "completeness": "N/A", "relevance": "N/A",
         }
         return {"verdict": verdict, "severity": severity, "unsupported_claims": [critique] if critique else [],
                 "repairable": repairable, "critique": critique, "repaired_answer": None}
@@ -276,11 +282,12 @@ class CriticAndRepair:
         threshold = getattr(self._cfg, "critic_uncertainty_threshold", 0.50)
         return uncertainty_count / len(sentences) >= threshold
 
-    def _parse_critic_output(self, raw: str) -> CriticResult:
+    def _parse_critic_output(self, raw: str, *, evaluate_answer_relevance: bool = True) -> CriticResult:
         def field(name: str, default: str = "FAIL") -> str:
             match = re.search(rf"^{name}:\s*(PASS|FAIL)\b", raw, flags=re.IGNORECASE | re.MULTILINE)
             return match.group(1).upper() if match else default
         groundedness = field("GROUNDEDNESS")
+        answer_relevance = field("ANSWER_RELEVANCE") if evaluate_answer_relevance else "N/A"
         completeness = field("COMPLETENESS")
         relevance = field("RELEVANCE")
         score_match = re.search(r"^SCORE:\s*(0(?:\.\d+)?|1(?:\.0+)?)\b", raw, flags=re.IGNORECASE | re.MULTILINE)
@@ -289,7 +296,12 @@ class CriticAndRepair:
         issues = issues_match.group(1).strip() if issues_match else "- Critic returned no parseable issue details."
         if issues.upper() == "- NONE":
             issues = ""
-        self.last_details = {"groundedness": groundedness, "completeness": completeness, "relevance": relevance}
+        self.last_details = {
+            "groundedness": groundedness,
+            "answer_relevance": answer_relevance,
+            "completeness": completeness,
+            "relevance": relevance,
+        }
         failed = [value for value in self.last_details.values() if value == "FAIL"]
         if not failed:
             verdict: Literal["PASS", "HALLUCINATED", "UNCERTAIN"] = "PASS"

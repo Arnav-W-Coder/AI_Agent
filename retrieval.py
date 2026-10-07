@@ -32,6 +32,29 @@ def _token_count(text: str) -> int:
         return max(1, len((text or "").split()))
 
 
+def stable_chunk_sort_key(chunk: dict, score_field: str = "rerank_score") -> tuple:
+    """Deterministic ranking key so equal scores do not reshuffle context."""
+    try:
+        score = float(chunk.get(score_field, float("-inf")))
+    except (TypeError, ValueError):
+        score = float("-inf")
+    source = str(chunk.get("source_url") or chunk.get("filename") or "").lower()
+    try:
+        page = int(chunk.get("page_number", 0) or 0)
+    except (TypeError, ValueError):
+        page = 0
+    stable_id = str(chunk.get("chroma_id") or chunk.get("parent_id") or "")
+    text_prefix = str(chunk.get("text") or chunk.get("text_preview") or "")[:120]
+    return (
+        1 if chunk.get("context_only") else 0,
+        -score,
+        source,
+        page,
+        stable_id,
+        text_prefix,
+    )
+
+
 class BM25Index:
     def __init__(self, db: Database, cfg: Optional[RAGConfig] = None) -> None:
         self.db = db
@@ -95,7 +118,7 @@ class CrossEncoderReranker:
         scores = np.asarray(raw_scores).reshape(-1).tolist()
         for chunk, score in zip(chunks, scores):
             chunk["rerank_score"] = round(float(score), 4)
-        ranked = sorted(chunks, key=lambda c: c["rerank_score"], reverse=True)
+        ranked = sorted(chunks, key=stable_chunk_sort_key)
         results = [c for c in ranked if c["rerank_score"] >= min_score][:top_k]
         checkpoint("retrieval.rerank_output", results, enabled=enabled, preview_chars=preview,
                    sample_items=samples, query=query, input_count=len(chunks), returned=len(results), min_score=min_score)
@@ -179,7 +202,9 @@ class HybridRetriever:
                             "has_table": bool(meta.get("has_table", chunk.get("has_table", False))),
                             "rrf_score": 0.0}
             rrf[cid]["rrf_score"] += self._rrf_score(rank)
-        candidates = sorted(rrf.values(), key=lambda c: c["rrf_score"], reverse=True)[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)]
+        candidates = sorted(
+            rrf.values(), key=lambda c: stable_chunk_sort_key(c, "rrf_score")
+        )[:max(self.cfg.top_k_dense, self.cfg.top_k_sparse)]
         checkpoint("retrieval.rrf.fused_output", candidates, enabled=self.cfg.debug_checkpoints,
                    preview_chars=self.cfg.checkpoint_preview_chars, sample_items=self.cfg.checkpoint_sample_items,
                    dense_count=len(dense_chunks), bm25_count=len(bm25_chunks), overlap=len(dense_ids & bm25_ids), returned=len(candidates))
