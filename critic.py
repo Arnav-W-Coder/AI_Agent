@@ -55,6 +55,13 @@ Evaluate four dimensions:
 4. RELEVANCE: The retrieved context must contain useful evidence for the
    question. Judge the context itself, not writing quality.
 
+For generated practice material, exercise-specific numbers may be invented as
+givens. Do not count those numbers alone as hallucinations. Instead, check that
+the underlying concept or formula is supported by the retrieved context and
+that each exercise is internally consistent and solvable from its stated givens.
+If a problem needs missing information or relies on an unsupported relationship,
+mark it as a quality failure.
+
 Return ONLY:
 GROUNDEDNESS: PASS or FAIL
 ANSWER_RELEVANCE: PASS or FAIL
