@@ -677,7 +677,7 @@ class ProductionRAGPipeline:
             if self._combined_evidence_is_answerable(question, current):
                 stop_reason = "answerable"
                 break
-            if not fetched_urls:
+            if not used_urls:
                 stop_reason = "no_new_sources"
                 break
 
@@ -775,6 +775,15 @@ class ProductionRAGPipeline:
         assert self.retriever is not None, "Call await setup() before query()."
         original_question = question
         trace = QueryTrace(query_text=original_question)
+        self._last_adaptive_web_usage = {
+            "enabled": bool(getattr(self.cfg, "adaptive_web_enabled", True)),
+            "rounds": 0, "network_sources": 0,
+            "stop_reason": "not_run", "elapsed_ms": 0.0,
+        }
+        self._last_web_scrape_stats = {
+            "query": "", "requested_urls": 0, "fetched_urls": [],
+            "used_urls": [], "cache_hits": 0, "new_chunks": 0,
+        }
         if conversation_id:
             chat_history = [
                 *self.memory.history(conversation_id),
@@ -821,6 +830,7 @@ class ProductionRAGPipeline:
         trace.rewritten_query = rewritten
         answer_cache_key = (
             f"question={question}\nrewritten_query={rewritten}\n"
+            f"answer_cache_schema_version={self.cfg.answer_cache_schema_version}\n"
             f"retrieval_cache_schema_version={self.cfg.retrieval_cache_schema_version}\n"
             f"critic_config_version={self.cfg.critic_config_version}\n"
             f"triad_config_version={self.cfg.triad_config_version}"
@@ -830,10 +840,52 @@ class ProductionRAGPipeline:
         )
         cached_answer = None
         cached_sources = []
+        cached_metadata = {}
         if cached:
-            cached_answer, cached_sources, _ = cached
+            cached_answer, cached_sources, cached_metadata = cached
             trace.answer_cache_hit = True
-            log.info("[Cache] Using cached answer as supplemental conversational context")
+            if (
+                self.cfg.return_validated_answer_cache
+                and cached_metadata.get("validated") is True
+            ):
+                now = time.time()
+                trace.t_retrieval = trace.t_rerank = trace.t_generation = trace.t_end = now
+                cached_triad = cached_metadata.get("rag_triad", {})
+                trace.answer_relevance = cached_triad.get("answer_relevance")
+                trace.context_relevance = cached_triad.get("context_relevance")
+                trace.answer_faithfulness = cached_triad.get("faithfulness")
+                trace.triad_pass = cached_triad.get("passed")
+                trace.triage_action = ";".join(cached_triad.get("triage_actions", []))
+                self.metrics.record(trace)
+                if conversation_id:
+                    self.memory.add_message(conversation_id, "assistant", cached_answer)
+                multimodal_usage = self._usage_from_sources(
+                    cached_sources, generation_mode="answer_cache"
+                )
+                log.info("[Cache] Returning validated answer cache HIT")
+                return {
+                    "answer": cached_answer,
+                    "sources": cached_sources,
+                    "critic": cached_metadata,
+                    "query_id": trace.query_id,
+                    "rewrite_id": rewrite_id,
+                    "rewritten_query": rewritten,
+                    "from_cache": True,
+                    "drift_alert": None,
+                    "conversation_id": conversation_id,
+                    "multimodal_usage": multimodal_usage,
+                    "metrics": {
+                        "total_ms": trace.total_ms(),
+                        "rewrite_ms": trace.latency_ms(trace.t_start, trace.t_rewrite),
+                        "answer_cache_hit": True,
+                        "adaptive_web": dict(self._last_adaptive_web_usage),
+                        "answer_relevance": trace.answer_relevance,
+                        "context_relevance": trace.context_relevance,
+                        "faithfulness": trace.answer_faithfulness,
+                        "triad_pass": trace.triad_pass,
+                    },
+                }
+            log.info("[Cache] Using unvalidated/stale-policy cache entry only as supplemental context")
         retrieval_cache_key = (
             f"{rewritten}\n"
             f"retrieval_cache_schema_version={self.cfg.retrieval_cache_schema_version}"

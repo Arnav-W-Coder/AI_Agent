@@ -68,6 +68,7 @@ class RAGConfig:
     retrieval_sim_threshold: float = 0.97
     answer_cache_schema_version: int = 3
     retrieval_cache_schema_version: int = 5
+    return_validated_answer_cache: bool = True
 
     # Ingestion
     embed_batch_size: int = 16

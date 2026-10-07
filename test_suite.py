@@ -177,6 +177,7 @@ class TestDatabase:
         assert cfg.adaptive_web_sources_per_round <= 2
         assert cfg.adaptive_web_max_rounds <= 2
         assert cfg.context_budget_tokens <= 5000
+        assert cfg.return_validated_answer_cache is True
 
     @pytest.mark.layer1
     def test_markdown_table_detection(self):
