@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+# This dataclass is the "control panel" for the entire RAG system.
+# Most runtime behavior is derived from these defaults: which model to use,
+# where to persist data, how many chunks to retrieve, and when to trigger
+# web fallback or critic-based repair.
 @dataclass
 class RAGConfig:
     # Models

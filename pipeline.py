@@ -147,6 +147,11 @@ def _select_web_results(results: list[dict], limit: int, min_domain_score: int) 
     return candidates[:limit]
 
 
+# ProductionRAGPipeline is the orchestrator for the real project.
+# It coordinates ingestion, retrieval, query rewriting, answerability checks,
+# optional web search, final generation, and critic-based repair. Think of this
+# class as the main control loop that turns a user question into evidence,
+# evidence into an answer, and that answer into a validated response.
 class ProductionRAGPipeline:
     """Wire ingestion, retrieval, generation, evaluation, and monitoring."""
 
@@ -256,6 +261,10 @@ class ProductionRAGPipeline:
     def _route_query(self, question: str, query_type: str,
                      queries: list[str]) -> dict:
         """Build the retrieval plan for a classified query."""
+        # Query routing decides how many retrieval variants to try and whether the
+        # system should search the web as well. Different question shapes benefit
+        # from different query expansions: how-to questions need guidance, while
+        # comparisons and recommendations need multiple candidate angles.
         plan = {
             "queries": list(dict.fromkeys(queries or [question])),
             "top_k": self.cfg.top_k_rerank,
@@ -395,6 +404,9 @@ class ProductionRAGPipeline:
 
     def _is_answerable(self, chunks: list[dict], question: str = "") -> bool:
         """Determine whether retrieved evidence is sufficient for generation."""
+        # The answerability check prevents the model from answering with weak or
+        # noisy evidence. We require enough relevant chunks and a strong enough
+        # top-score signal before we allow generation to proceed.
         score_chunks = [
             chunk
             for chunk in chunks

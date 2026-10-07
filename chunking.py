@@ -13,6 +13,14 @@ from checkpoints import checkpoint
 
 log = logging.getLogger(__name__)
 
+# The chunker tries to preserve document structure instead of slicing PDFs into
+# arbitrary fixed-size windows. The flow is:
+#   1) detect headings / sections,
+#   2) create semantic paragraphs and blocks,
+#   3) build parent summaries for context expansion,
+#   4) split each parent into child chunks for vector indexing.
+# This improves retrieval precision and gives the system enough surrounding
+# context to answer questions that span multiple paragraphs.
 @dataclass
 class Section:
     title: str

@@ -162,6 +162,11 @@ def _filter_and_rank_urls(results: list[dict]) -> list[dict]:
 
 # ── Step 1: Ingest PDFs ───────────────────────────────────────────────────────
 
+# This file is the earlier, simpler proof-of-concept version of the project.
+# It directly loads PDFs from ./docs, chunks them, embeds them with Ollama, and
+# adds a basic web search tool. The production system in pipeline.py builds on
+# the same ideas but adds routing, caching, answer validation, and richer
+# metadata tracking.
 print("Loading and indexing documents...")
 
 loader    = DirectoryLoader(DOCS_DIR, glob="**/*.pdf", loader_cls=PyPDFLoader)

@@ -9,6 +9,11 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Generator
 
+# SQLite is the durable metadata layer for the project.
+# ChromaDB holds the embedding vectors and fast nearest-neighbor search, while
+# SQLite keeps the canonical document inventory, chunk metadata, conversation
+# history, and cache state. This split makes retrieval fast without losing
+# source provenance and debugging information.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
     id TEXT PRIMARY KEY,

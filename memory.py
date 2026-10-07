@@ -13,6 +13,9 @@ from typing import Optional
 from db import Database
 
 
+# ConversationMemory is just a small, persistent chat log.
+# It stores the recent dialogue in SQLite so a follow-up question can be
+# contextualized without hiding the underlying retrieval logic inside the LLM.
 class ConversationMemory:
     """Persist and retrieve short-term conversation history using SQLite."""
 

@@ -17,7 +17,10 @@ from db import Database
 
 log = logging.getLogger(__name__)
 
-
+# Retrieval is hybrid: lexical search (BM25), dense vector search (Chroma), and
+# a reranking pass that evaluates the final candidate set against the query.
+# The end result is a more reliable set of evidence chunks than any one method
+# alone would produce.
 def _tokenize(text: str) -> list[str]:
     return re.findall(r"\w+", text.lower())
 

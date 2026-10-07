@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 _COLLECTION = "web_cache"
 
 
+# WebChunkStore caches scraped pages and their text chunks in a separate Chroma
+# collection from the local PDF collection. This lets the system query the web
+# on demand, keep source metadata, and avoid re-scraping or re-embedding pages
+# that are still within their TTL window.
 class WebChunkStore:
     """Persistent, TTL-aware web chunk store with explicit source provenance."""
 
