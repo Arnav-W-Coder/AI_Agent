@@ -1600,12 +1600,6 @@ class ProductionRAGPipeline:
                     "question": question,
                     "max_problems": self.cfg.practice_max_problems,
                 })
-            if query_type == "practice":
-                return self._practice_chain.invoke({
-                    "context": context,
-                    "question": question,
-                    "max_problems": self.cfg.practice_max_problems,
-                })
             return self._rag_chain.invoke({"context": context, "question": question})
         self._last_multimodal_usage = {
             "generation_mode": "vision", "images_attached": len(image_chunks),
@@ -1631,6 +1625,12 @@ class ProductionRAGPipeline:
         except Exception as exc:
             log.warning("[Generation] Vision model failed; using text-only generation: %s", exc)
             self._last_multimodal_usage["generation_mode"] = "text_only_fallback"
+            if query_type == "practice":
+                return self._practice_chain.invoke({
+                    "context": context,
+                    "question": question,
+                    "max_problems": self.cfg.practice_max_problems,
+                })
             return self._rag_chain.invoke({"context": context, "question": question})
 
     @staticmethod
