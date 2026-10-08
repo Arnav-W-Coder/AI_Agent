@@ -702,6 +702,7 @@ class TestCriticAndAnswerControls:
         instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
         instance.cfg = cfg
         cfg.answerability_min_chunks = 2
+        cfg.answerability_use_absolute_rerank_thresholds = True
         cfg.answerability_min_top_score = 0.7
         cfg.answerability_min_mean_score = 0.6
         assert instance._is_answerable([
@@ -739,6 +740,7 @@ class TestCriticAndAnswerControls:
         instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
         instance.cfg = cfg
         cfg.answerability_min_chunks = 2
+        cfg.answerability_use_absolute_rerank_thresholds = True
         cfg.answerability_min_top_score = 0.0
         cfg.answerability_min_mean_score = 0.0
         cfg.answerability_min_query_term_coverage = 0.5
@@ -755,6 +757,7 @@ class TestCriticAndAnswerControls:
         instance = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
         instance.cfg = cfg
         cfg.answerability_min_chunks = 2
+        cfg.answerability_use_absolute_rerank_thresholds = True
         cfg.answerability_min_top_score = 0.7
         cfg.answerability_min_mean_score = 0.6
         cfg.web_min_candidates = 2
@@ -1520,6 +1523,7 @@ class TestOriginalQuestionReranking:
         pipeline = ProductionRAGPipeline.__new__(ProductionRAGPipeline)
         pipeline.cfg = cfg
         cfg.answerability_min_chunks = 2
+        cfg.answerability_use_absolute_rerank_thresholds = True
         cfg.answerability_min_top_score = -8.0
         cfg.answerability_min_mean_score = -8.0
         chunks = [
